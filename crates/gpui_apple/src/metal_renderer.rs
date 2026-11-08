@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
     AtlasTextureId, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
-    ScaledPixels, Scene, Size, point, size,
+    ScaledPixels, Scene, Size, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -34,9 +34,6 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
 use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
-
-// Exported to metal
-pub(crate) type PointF = gpui::Point<f32>;
 
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
@@ -142,7 +139,6 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
@@ -275,13 +271,6 @@ impl MetalRenderer {
             ))
             .context("loading Metal library")?;
 
-        fn to_float2_bits(point: PointF) -> u64 {
-            let mut output = point.y.to_bits() as u64;
-            output <<= 32;
-            output |= point.x.to_bits() as u64;
-            output
-        }
-
         // Shared memory can be used only if CPU and GPU share the same memory space.
         // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
         // iOS does not support managed resources. Its simulator may report a
@@ -290,29 +279,6 @@ impl MetalRenderer {
         // Only Apple GPUs can create shared-storage textures on macOS.
         // https://developer.apple.com/documentation/metal/mtlgpufamily
         let is_apple_gpu = device.supportsFamily(MTLGPUFamily::Apple1);
-
-        let unit_vertices = [
-            to_float2_bits(point(0., 0.)),
-            to_float2_bits(point(1., 0.)),
-            to_float2_bits(point(0., 1.)),
-            to_float2_bits(point(0., 1.)),
-            to_float2_bits(point(1., 0.)),
-            to_float2_bits(point(1., 1.)),
-        ];
-        // SAFETY: Metal copies the live array using its exact byte length.
-        let unit_vertices = unsafe {
-            device.newBufferWithBytes_length_options(
-                ptr::NonNull::from(&unit_vertices).cast(),
-                mem::size_of_val(&unit_vertices),
-                if is_unified_memory {
-                    MTLResourceOptions::StorageModeShared
-                        | MTLResourceOptions::CPUCacheModeWriteCombined
-                } else {
-                    MTLResourceOptions::StorageModeManaged
-                },
-            )
-        }
-        .context("allocating unit vertex buffer")?;
 
         let path_tiles_pipeline_state = build_pipeline_state(
             &device,
@@ -408,7 +374,6 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
-            unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
@@ -762,15 +727,24 @@ impl MetalRenderer {
                 alpha,
             },
         )?;
+        // SAFETY: Metal copies the viewport bytes, which match every vertex
+        // shader's `GlobalInputIndex_ViewportSize` argument.
+        unsafe {
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&viewport_size).cast(),
+                mem::size_of_val(&viewport_size),
+                GlobalInputIndex::ViewportSize as usize,
+            );
+        }
 
         let mut path_tile_cursor = 0;
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, &command_encoder)
+                    self.draw_shadows(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, &command_encoder)
+                    self.draw_quads(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::Paths(range) => {
                     let tiles_start = path_tile_cursor;
@@ -781,19 +755,17 @@ impl MetalRenderer {
                     self.draw_path_tiles(
                         tiles_start..path_tile_cursor,
                         instance_bindings,
-                        viewport_size,
                         &command_encoder,
                     )
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, &command_encoder)
+                    self.draw_underlines(range, instance_bindings, &command_encoder)
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
                         instance_bindings,
-                        viewport_size,
                         &command_encoder,
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
@@ -801,7 +773,6 @@ impl MetalRenderer {
                         texture_id,
                         range,
                         instance_bindings,
-                        viewport_size,
                         &command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => {
@@ -809,7 +780,6 @@ impl MetalRenderer {
                         &scene.surfaces[range.clone()],
                         range.start,
                         instance_bindings,
-                        viewport_size,
                         &command_encoder,
                         surface_textures,
                     ) {
@@ -830,7 +800,6 @@ impl MetalRenderer {
         &self,
         tiles: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if tiles.is_empty() {
@@ -839,7 +808,7 @@ impl MetalRenderer {
 
         command_encoder.setRenderPipelineState(&self.path_tiles_pipeline_state);
         // SAFETY: The scene's tile range and its curves and paints match the uploaded shader layouts and slots.
-        // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
+        // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.path_tiles.buffer),
@@ -850,11 +819,6 @@ impl MetalRenderer {
                 Some(&instance_bindings.path_paints.buffer),
                 instance_bindings.path_paints.offset,
                 PathTileInputIndex::Paints as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                PathTileInputIndex::ViewportSize as usize,
             );
             command_encoder.setFragmentBuffer_offset_atIndex(
                 Some(&instance_bindings.path_tiles.buffer),
@@ -885,7 +849,6 @@ impl MetalRenderer {
         &self,
         shadows: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if shadows.is_empty() {
@@ -893,14 +856,9 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.shadows_pipeline_state);
-        // SAFETY: Six unit vertices and the scene's shadow range match the uploaded shader layouts and slots.
-        // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
+        // SAFETY: The scene's shadow range matches the uploaded shader layouts and slots.
+        // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                ShadowInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.shadows.buffer),
                 instance_bindings.shadows.offset,
@@ -911,15 +869,10 @@ impl MetalRenderer {
                 instance_bindings.shadows.offset,
                 ShadowInputIndex::Shadows as usize,
             );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                ShadowInputIndex::ViewportSize as usize,
-            );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::Triangle,
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                6,
+                4,
                 shadows.len(),
                 shadows.start,
             );
@@ -930,7 +883,6 @@ impl MetalRenderer {
         &self,
         quads: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if quads.is_empty() {
@@ -938,14 +890,9 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.quads_pipeline_state);
-        // SAFETY: Six unit vertices and the scene's quad range match the uploaded shader layouts and slots.
-        // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
+        // SAFETY: The scene's quad range matches the uploaded shader layouts and slots.
+        // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                QuadInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.quads.buffer),
                 instance_bindings.quads.offset,
@@ -956,15 +903,10 @@ impl MetalRenderer {
                 instance_bindings.quads.offset,
                 QuadInputIndex::Quads as usize,
             );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                QuadInputIndex::ViewportSize as usize,
-            );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::Triangle,
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                6,
+                4,
                 quads.len(),
                 quads.start,
             );
@@ -975,7 +917,6 @@ impl MetalRenderer {
         &self,
         underlines: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if underlines.is_empty() {
@@ -983,14 +924,9 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.underlines_pipeline_state);
-        // SAFETY: Six unit vertices and the scene's underline range match the uploaded shader layouts and slots.
-        // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
+        // SAFETY: The scene's underline range matches the uploaded shader layouts and slots.
+        // Metal retains the buffers, and writer.finish publishes their writes.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                UnderlineInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.underlines.buffer),
                 instance_bindings.underlines.offset,
@@ -1001,15 +937,10 @@ impl MetalRenderer {
                 instance_bindings.underlines.offset,
                 UnderlineInputIndex::Underlines as usize,
             );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                UnderlineInputIndex::ViewportSize as usize,
-            );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::Triangle,
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                6,
+                4,
                 underlines.len(),
                 underlines.start,
             );
@@ -1021,7 +952,6 @@ impl MetalRenderer {
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if sprites.is_empty() {
@@ -1036,23 +966,13 @@ impl MetalRenderer {
             DevicePixels(texture.height() as i32),
         );
         command_encoder.setRenderPipelineState(&self.monochrome_sprites_pipeline_state);
-        // SAFETY: The scene's sprite range, six unit vertices, and copied sizes match the shader layouts and slots.
+        // SAFETY: The scene's sprite range and copied sizes match the shader layouts and slots.
         // Metal retains the buffers and texture, and writer.finish publishes the instance writes.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                SpriteInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.monochrome_sprites.buffer),
                 instance_bindings.monochrome_sprites.offset,
                 SpriteInputIndex::Sprites as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                SpriteInputIndex::ViewportSize as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&texture_size).cast(),
@@ -1069,9 +989,9 @@ impl MetalRenderer {
                 SpriteInputIndex::AtlasTexture as usize,
             );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::Triangle,
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                6,
+                4,
                 sprites.len(),
                 sprites.start,
             );
@@ -1083,7 +1003,6 @@ impl MetalRenderer {
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
         if sprites.is_empty() {
@@ -1098,23 +1017,13 @@ impl MetalRenderer {
             DevicePixels(texture.height() as i32),
         );
         command_encoder.setRenderPipelineState(&self.polychrome_sprites_pipeline_state);
-        // SAFETY: The scene's sprite range, six unit vertices, and copied sizes match the shader layouts and slots.
+        // SAFETY: The scene's sprite range and copied sizes match the shader layouts and slots.
         // Metal retains the buffers and texture, and writer.finish publishes the instance writes.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                SpriteInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.polychrome_sprites.buffer),
                 instance_bindings.polychrome_sprites.offset,
                 SpriteInputIndex::Sprites as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                SpriteInputIndex::ViewportSize as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&texture_size).cast(),
@@ -1131,9 +1040,9 @@ impl MetalRenderer {
                 SpriteInputIndex::AtlasTexture as usize,
             );
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::Triangle,
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                6,
+                4,
                 sprites.len(),
                 sprites.start,
             );
@@ -1145,7 +1054,6 @@ impl MetalRenderer {
         surfaces: &[PaintSurface],
         first_surface: usize,
         instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<()> {
@@ -1154,23 +1062,13 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.surfaces_pipeline_state);
-        // SAFETY: The unit vertices, SurfaceBounds instances, and copied viewport match the shader layouts and slots.
+        // SAFETY: The SurfaceBounds instances match the shader layout and slot.
         // Metal retains the buffers, and writer.finish publishes CPU writes before submission.
         unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                SurfaceInputIndex::Vertices as usize,
-            );
             command_encoder.setVertexBuffer_offset_atIndex(
                 Some(&instance_bindings.surfaces.buffer),
                 instance_bindings.surfaces.offset,
                 SurfaceInputIndex::Surfaces as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                SurfaceInputIndex::ViewportSize as usize,
             );
         }
 
@@ -1240,12 +1138,12 @@ impl MetalRenderer {
             }
             surface_textures.extend([y_texture, cb_cr_texture]);
 
-            // SAFETY: Six unit vertices draw one instance within the uploaded scene's surface range.
+            // SAFETY: This draws one instance within the uploaded scene's surface range.
             unsafe {
                 command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                    MTLPrimitiveType::Triangle,
+                    MTLPrimitiveType::TriangleStrip,
                     0,
-                    6,
+                    4,
                     1,
                     first_surface + index,
                 );
@@ -1532,52 +1430,48 @@ impl InstanceBufferWriter {
     }
 }
 
+/// Vertex buffer slots bound once per render pass and shared by every
+/// pipeline. Each primitive's own slots start after these.
+#[repr(C)]
+enum GlobalInputIndex {
+    ViewportSize = 0,
+}
+
 #[repr(C)]
 enum ShadowInputIndex {
-    Vertices = 0,
     Shadows = 1,
-    ViewportSize = 2,
 }
 
 #[repr(C)]
 enum QuadInputIndex {
-    Vertices = 0,
     Quads = 1,
-    ViewportSize = 2,
 }
 
 #[repr(C)]
 enum UnderlineInputIndex {
-    Vertices = 0,
     Underlines = 1,
-    ViewportSize = 2,
 }
 
 #[repr(C)]
 enum SpriteInputIndex {
-    Vertices = 0,
     Sprites = 1,
-    ViewportSize = 2,
-    AtlasTextureSize = 3,
-    AtlasTexture = 4,
+    AtlasTextureSize = 2,
+    AtlasTexture = 3,
 }
 
 #[repr(C)]
 enum SurfaceInputIndex {
-    Vertices = 0,
     Surfaces = 1,
-    ViewportSize = 2,
-    TextureSize = 3,
-    YTexture = 4,
-    CbCrTexture = 5,
+    TextureSize = 2,
+    YTexture = 3,
+    CbCrTexture = 4,
 }
 
 #[repr(C)]
 enum PathTileInputIndex {
-    Tiles = 0,
-    Curves = 1,
-    Paints = 2,
-    ViewportSize = 3,
+    Tiles = 1,
+    Curves = 2,
+    Paints = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
