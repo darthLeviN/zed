@@ -1060,7 +1060,10 @@ StructuredBuffer<PathPaint> path_paints: register(t3);
 
 struct PathTileFragmentInput {
     float4 position: SV_Position;
-    nointerpolation uint tile_id: TEXCOORD0;
+    // The curve start, curve count, backdrop and fill rule.
+    nointerpolation uint4 tile: TEXCOORD0;
+    nointerpolation float2 reference: TEXCOORD1;
+    nointerpolation uint paint_id: TEXCOORD3;
     PreparedBackground background;
 };
 
@@ -1082,7 +1085,9 @@ PathTileFragmentInput path_tile_vertex(uint vertex_id: SV_VertexID, uint tile_id
 
     PathTileFragmentInput output;
     output.position = to_device_position_impl(position);
-    output.tile_id = tile_index;
+    output.tile = uint4(tile.curve_start, tile.curve_count, asuint(tile.backdrop), paint.even_odd);
+    output.reference = tile.reference;
+    output.paint_id = tile.paint;
     output.background = prepare_background(paint.color);
     return output;
 }
@@ -1153,22 +1158,22 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 }
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
-    PathTile tile = path_tiles[input.tile_id];
-    PathPaint paint = path_paints[tile.paint];
     float2 center = floor(input.position.xy) + 0.5;
+    uint curve_start = input.tile.x;
+    uint curve_count = input.tile.y;
 
-    float2 winding = float(tile.backdrop);
+    float2 winding = float(asint(input.tile.z));
     float2 weight = float2(0.0, 0.0);
     [loop]
-    for (uint i = 0u; i < tile.curve_count; i++) {
-        PathCurve curve = path_curves[tile.curve_start + i];
+    for (uint i = 0u; i < curve_count; i++) {
+        PathCurve curve = path_curves[curve_start + i];
         if (min(curve.p0.x, curve.p1.x) >= center.x + 0.5) {
             break;
         }
         if (curve.p0.y < center.y + 0.5) {
             add_curve_winding(curve, center, winding, weight);
-            correct_for_endpoint(curve.p0, curve.sign, tile.reference, center, winding);
-            correct_for_endpoint(curve.p1, -curve.sign, tile.reference, center, winding);
+            correct_for_endpoint(curve.p0, curve.sign, input.reference, center, winding);
+            correct_for_endpoint(curve.p1, -curve.sign, input.reference, center, winding);
         }
     }
 
@@ -1177,7 +1182,7 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     float coverage = max(
         abs(dot(winding, weight)) / max(weight.x + weight.y, 1.0 / 65536.0),
         min(abs(winding.x), abs(winding.y)));
-    coverage = paint.even_odd != 0u
+    coverage = input.tile.w != 0u
         ? 1.0 - abs(1.0 - frac(coverage * 0.5) * 2.0)
         : saturate(coverage);
 
@@ -1185,8 +1190,12 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
-    float4 color =
-        background_color(input.background, paint.color, paint.bounds, input.position.xy);
+    float4 color = input.background.color0;
+    [branch]
+    if (input.background.tag != 0u) {
+        PathPaint paint = path_paints[input.paint_id];
+        color = background_color(input.background, paint.color, paint.bounds, input.position.xy);
+    }
     return float4(color.rgb, color.a * coverage);
 }
 
