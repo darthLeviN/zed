@@ -1178,6 +1178,8 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 }
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
+    // Measurement only: skips all curve work, to find the cost of just blending the path's pixels.
+    return input.background.color0;
     float2 center = floor(input.position.xy) + 0.5;
     if (input.background.tag == 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
