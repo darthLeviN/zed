@@ -105,6 +105,7 @@ pub(crate) fn bin(curves: &[PathCurve], even_odd: bool, scale: f32) -> PathTiles
         binner.find_spans(&grid);
         binner.fill_cells();
         let (tiles, curves) = binner.merge_cells(&grid, even_odd);
+        let tiles = split_interiors(tiles, &curves);
         let device = |p: Point<f32>| point(ScaledPixels(p.x), ScaledPixels(p.y));
         PathTiles {
             bounds: Bounds::from_corners(device(min), device(max)),
@@ -112,6 +113,55 @@ pub(crate) fn bin(curves: &[PathCurve], even_odd: bool, scale: f32) -> PathTiles
             curves,
         }
     })
+}
+
+/// Measurement only: splits the area beyond each tile's curves into solid tiles.
+fn split_interiors(tiles: Vec<PathTile>, curves: &[PathCurve]) -> Vec<PathTile> {
+    let mut output = Vec::with_capacity(tiles.len() * 2);
+    for tile in tiles {
+        if tile.curve_count == 0 {
+            output.push(tile);
+            continue;
+        }
+        let start = tile.curve_start as usize;
+        let list = curves
+            .get(start..start + tile.curve_count as usize)
+            .unwrap_or_default();
+        let mut min = point(f32::INFINITY, f32::INFINITY);
+        let mut max = point(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for curve in list {
+            min.x = min.x.fast_min(curve.min_x());
+            max.x = max.x.fast_max(curve.max_x());
+            min.y = min.y.fast_min(curve.p0.y);
+            max.y = max.y.fast_max(curve.p1.y);
+        }
+        let left = (min.x - MARGIN).fast_clamp(tile.top_left.x, tile.bottom_right.x);
+        let right = (max.x + MARGIN).fast_clamp(left, tile.bottom_right.x);
+        let top = (min.y - MARGIN).fast_clamp(tile.top_left.y, tile.bottom_right.y);
+        let bottom = (max.y + MARGIN).fast_clamp(top, tile.bottom_right.y);
+        let mut solid = |top_left: Point<f32>, bottom_right: Point<f32>| {
+            if top_left.x < bottom_right.x && top_left.y < bottom_right.y {
+                output.push(PathTile {
+                    curve_start: 0,
+                    curve_count: 0,
+                    backdrop: 1,
+                    top_left,
+                    bottom_right,
+                    ..tile
+                });
+            }
+        };
+        solid(tile.top_left, point(tile.bottom_right.x, top));
+        solid(point(tile.top_left.x, bottom), tile.bottom_right);
+        solid(point(tile.top_left.x, top), point(left, bottom));
+        solid(point(right, top), point(tile.bottom_right.x, bottom));
+        output.push(PathTile {
+            top_left: point(left, top),
+            bottom_right: point(right, bottom),
+            ..tile
+        });
+    }
+    output
 }
 
 /// Picks the power-of-two cell size that minimizes the estimated time spent
