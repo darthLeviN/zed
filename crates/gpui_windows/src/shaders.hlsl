@@ -1058,12 +1058,17 @@ StructuredBuffer<PathTile> path_tiles: register(t1);
 StructuredBuffer<PathCurve> path_curves: register(t2);
 StructuredBuffer<PathPaint> path_paints: register(t3);
 
+// The distance the binner keeps between a tile's edge and the curves it doesn't list.
+static const float PATH_TILE_MARGIN = 0.5 + 1.0 / 256.0;
+
 struct PathTileFragmentInput {
     float4 position: SV_Position;
     // The curve start, curve count, backdrop and fill rule.
     nointerpolation uint4 tile: TEXCOORD0;
     nointerpolation float2 reference: TEXCOORD1;
     nointerpolation uint paint_id: TEXCOORD3;
+    // The bounds of the pixel centers that the tile's curves can affect.
+    nointerpolation float4 curve_box: TEXCOORD4;
     PreparedBackground background;
 };
 
@@ -1089,6 +1094,21 @@ PathTileFragmentInput path_tile_vertex(uint vertex_id: SV_VertexID, uint tile_id
     output.reference = tile.reference;
     output.paint_id = tile.paint;
     output.background = prepare_background(paint.color);
+
+    // A tile only keeps area beyond its curves where that area is filled, so pixels outside
+    // this box need no curves. An empty box puts every pixel outside it.
+    float4 curve_box = float4(1e30, 1e30, -1e30, -1e30);
+    if (tile.curve_count > 8u) {
+        curve_box = float4(-1e30, -1e30, 1e30, 1e30);
+    } else {
+        [loop]
+        for (uint i = 0u; i < tile.curve_count; i++) {
+            PathCurve curve = path_curves[tile.curve_start + i];
+            curve_box.xy = min(curve_box.xy, min(curve.p0, curve.p1) - PATH_TILE_MARGIN);
+            curve_box.zw = max(curve_box.zw, max(curve.p0, curve.p1) + PATH_TILE_MARGIN);
+        }
+    }
+    output.curve_box = curve_box;
     return output;
 }
 
@@ -1159,6 +1179,10 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     float2 center = floor(input.position.xy) + 0.5;
+    if (input.background.tag == 0u
+        && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
+        return input.background.color0;
+    }
     uint curve_start = input.tile.x;
     uint curve_count = input.tile.y;
 
