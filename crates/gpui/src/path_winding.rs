@@ -381,7 +381,19 @@ impl Binner {
                     }
                     None => {
                         let curve_start = curves.len();
-                        curves.extend(listed(keys, input, run.list).copied());
+                        // Tiles are trimmed to their curves' extents, so the path is known to be
+                        // filled for pixels outside this box.
+                        let mut curves_top_left = point(f32::INFINITY, f32::INFINITY);
+                        let mut curves_bottom_right = point(f32::NEG_INFINITY, f32::NEG_INFINITY);
+                        for curve in listed(keys, input, run.list) {
+                            curves_top_left.x = curves_top_left.x.fast_min(curve.min_x() - MARGIN);
+                            curves_top_left.y = curves_top_left.y.fast_min(curve.p0.y - MARGIN);
+                            curves_bottom_right.x =
+                                curves_bottom_right.x.fast_max(curve.max_x() + MARGIN);
+                            curves_bottom_right.y =
+                                curves_bottom_right.y.fast_max(curve.p1.y + MARGIN);
+                            curves.push(*curve);
+                        }
                         tiles.push(PathTile {
                             paint: 0,
                             curve_start: curve_start as u32,
@@ -390,6 +402,8 @@ impl Binner {
                             bottom_right: run.bottom_right,
                             reference: grid.cell(run.start, row).top_left(),
                             backdrop: run.backdrop,
+                            curves_top_left,
+                            curves_bottom_right,
                         });
                         tiles.len() - 1
                     }
