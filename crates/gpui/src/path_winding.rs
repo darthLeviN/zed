@@ -105,7 +105,6 @@ pub(crate) fn bin(curves: &[PathCurve], even_odd: bool, scale: f32) -> PathTiles
         binner.find_spans(&grid);
         binner.fill_cells();
         let (tiles, curves) = binner.merge_cells(&grid, even_odd);
-        let tiles = split_interiors(tiles, &curves);
         let device = |p: Point<f32>| point(ScaledPixels(p.x), ScaledPixels(p.y));
         PathTiles {
             bounds: Bounds::from_corners(device(min), device(max)),
@@ -113,55 +112,6 @@ pub(crate) fn bin(curves: &[PathCurve], even_odd: bool, scale: f32) -> PathTiles
             curves,
         }
     })
-}
-
-/// Measurement only: splits the area beyond each tile's curves into solid tiles.
-fn split_interiors(tiles: Vec<PathTile>, curves: &[PathCurve]) -> Vec<PathTile> {
-    let mut output = Vec::with_capacity(tiles.len() * 2);
-    for tile in tiles {
-        if tile.curve_count == 0 {
-            output.push(tile);
-            continue;
-        }
-        let start = tile.curve_start as usize;
-        let list = curves
-            .get(start..start + tile.curve_count as usize)
-            .unwrap_or_default();
-        let mut min = point(f32::INFINITY, f32::INFINITY);
-        let mut max = point(f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for curve in list {
-            min.x = min.x.fast_min(curve.min_x());
-            max.x = max.x.fast_max(curve.max_x());
-            min.y = min.y.fast_min(curve.p0.y);
-            max.y = max.y.fast_max(curve.p1.y);
-        }
-        let left = (min.x - MARGIN).fast_clamp(tile.top_left.x, tile.bottom_right.x);
-        let right = (max.x + MARGIN).fast_clamp(left, tile.bottom_right.x);
-        let top = (min.y - MARGIN).fast_clamp(tile.top_left.y, tile.bottom_right.y);
-        let bottom = (max.y + MARGIN).fast_clamp(top, tile.bottom_right.y);
-        let mut solid = |top_left: Point<f32>, bottom_right: Point<f32>| {
-            if top_left.x < bottom_right.x && top_left.y < bottom_right.y {
-                output.push(PathTile {
-                    curve_start: 0,
-                    curve_count: 0,
-                    backdrop: 1,
-                    top_left,
-                    bottom_right,
-                    ..tile
-                });
-            }
-        };
-        solid(tile.top_left, point(tile.bottom_right.x, top));
-        solid(point(tile.top_left.x, bottom), tile.bottom_right);
-        solid(point(tile.top_left.x, top), point(left, bottom));
-        solid(point(right, top), point(tile.bottom_right.x, bottom));
-        output.push(PathTile {
-            top_left: point(left, top),
-            bottom_right: point(right, bottom),
-            ..tile
-        });
-    }
-    output
 }
 
 /// Picks the power-of-two cell size that minimizes the estimated time spent
@@ -424,7 +374,21 @@ impl Binner {
                     }
                     None => {
                         let curve_start = curves.len();
-                        curves.extend(listed(keys, input, run.list).copied());
+                        // A tile only keeps area beyond its curves where that area is
+                        // filled, so the shader can skip the curves for pixels outside
+                        // this box. With no curves, the box is empty and every pixel is
+                        // outside it.
+                        let mut curves_top_left = point(f32::INFINITY, f32::INFINITY);
+                        let mut curves_bottom_right = point(f32::NEG_INFINITY, f32::NEG_INFINITY);
+                        for curve in listed(keys, input, run.list) {
+                            curves_top_left.x = curves_top_left.x.fast_min(curve.min_x() - MARGIN);
+                            curves_top_left.y = curves_top_left.y.fast_min(curve.p0.y - MARGIN);
+                            curves_bottom_right.x =
+                                curves_bottom_right.x.fast_max(curve.max_x() + MARGIN);
+                            curves_bottom_right.y =
+                                curves_bottom_right.y.fast_max(curve.p1.y + MARGIN);
+                            curves.push(curve.in_path_order());
+                        }
                         tiles.push(PathTile {
                             paint: 0,
                             curve_start: curve_start as u32,
@@ -433,6 +397,8 @@ impl Binner {
                             bottom_right: run.bottom_right,
                             reference: grid.cell(run.start, row).top_left(),
                             backdrop: run.backdrop,
+                            curves_top_left,
+                            curves_bottom_right,
                         });
                         tiles.len() - 1
                     }
@@ -657,6 +623,21 @@ impl PathCurve {
         }
     }
 
+    /// The curve as the shader reads it: from the point the path reaches first to the
+    /// one it reaches last, so that the endpoints alone give its direction.
+    fn in_path_order(&self) -> Self {
+        if self.sign < 0.0 {
+            Self {
+                p0: self.p1,
+                p1: self.p0,
+                b: point(-(2.0 * self.a.x + self.b.x), -(2.0 * self.a.y + self.b.y)),
+                ..*self
+            }
+        } else {
+            *self
+        }
+    }
+
     fn min_x(&self) -> f32 {
         self.p0.x.fast_min(self.p1.x)
     }
@@ -851,6 +832,224 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The shader skips a tile's curves for pixels outside the box around
+    /// them, treating those pixels as fully covered. That holds because a
+    /// tile is trimmed wherever the area beyond its curves is unfilled, so
+    /// check it against the shader's own coverage for every such pixel.
+    #[test]
+    fn pixels_outside_the_curve_box_are_covered() {
+        for (name, path) in shapes() {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let binned = path.bin(scale);
+                for tile in binned.tiles() {
+                    let start = tile.curve_start as usize;
+                    // The port below reads downward curves; converting again restores them.
+                    let list: Vec<PathCurve> = binned.curves()
+                        [start..start + tile.curve_count as usize]
+                        .iter()
+                        .map(|curve| curve.in_path_order())
+                        .collect();
+                    let list = &list;
+                    let mut y = tile.top_left.y.floor() + 0.5;
+                    while y < tile.bottom_right.y {
+                        let mut x = tile.top_left.x.floor() + 0.5;
+                        while x < tile.bottom_right.x {
+                            let in_tile = x >= tile.top_left.x && y >= tile.top_left.y;
+                            let outside_box = x < tile.curves_top_left.x
+                                || y < tile.curves_top_left.y
+                                || x > tile.curves_bottom_right.x
+                                || y > tile.curves_bottom_right.y;
+                            if in_tile && outside_box {
+                                let coverage =
+                                    shader_coverage(tile, list, point(x, y), path.even_odd());
+                                assert_eq!(
+                                    coverage, 1.0,
+                                    "{name} at scale {scale}, pixel ({x}, {y}) of {tile:?}"
+                                );
+                            }
+                            x += 1.0;
+                        }
+                        y += 1.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The path fragment shader's coverage for the pixel centered at `center`.
+    fn shader_coverage(
+        tile: &PathTile,
+        list: &[PathCurve],
+        center: Point<f32>,
+        even_odd: bool,
+    ) -> f32 {
+        let saturate = |value: f32| value.clamp(0.0, 1.0);
+        let mut winding = point(tile.backdrop as f32, tile.backdrop as f32);
+        let mut weight = point(0.0f32, 0.0f32);
+        for curve in list {
+            if curve.min_x() >= center.x + 0.5 {
+                break;
+            }
+            if curve.p0.y >= center.y + 0.5 {
+                continue;
+            }
+            if curve.crosses(center.y) {
+                if curve.max_x() <= center.x - 0.5 {
+                    winding.x += curve.sign;
+                } else {
+                    let t =
+                        monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - center.y, 1.0);
+                    let x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
+                    let distance = center.x - x;
+                    winding.x += curve.sign * saturate(distance + 0.5);
+                    weight.x = weight.x.max(saturate(1.0 - 2.0 * distance.abs()));
+                }
+            }
+            if curve.min_x() <= center.x && center.x < curve.max_x() {
+                let direction = if curve.p1.x > curve.p0.x { 1.0 } else { -1.0 };
+                if curve.p1.y <= center.y - 0.5 {
+                    winding.y -= curve.sign * direction;
+                } else {
+                    let t = monotone_quadratic_root(
+                        curve.a.x,
+                        curve.b.x,
+                        curve.p0.x - center.x,
+                        direction,
+                    );
+                    let y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
+                    let distance = center.y - y;
+                    winding.y -= curve.sign * direction * saturate(distance + 0.5);
+                    weight.y = weight.y.max(saturate(1.0 - 2.0 * distance.abs()));
+                }
+            }
+            for (endpoint, step) in [(curve.p0, curve.sign), (curve.p1, -curve.sign)] {
+                if endpoint.x <= tile.reference.x {
+                    let below_center = f32::from(endpoint.y <= center.y);
+                    let below_reference = f32::from(endpoint.y <= tile.reference.y);
+                    winding.x -= step * (below_center - below_reference);
+                }
+                if endpoint.y <= tile.reference.y && endpoint.x <= center.x {
+                    winding.y += step;
+                }
+            }
+        }
+        let blended = (winding.x * weight.x + winding.y * weight.y).abs()
+            / (weight.x + weight.y).max(1.0 / 65536.0);
+        let coverage = blended.max(winding.x.abs().min(winding.y.abs()));
+        if even_odd {
+            1.0 - (1.0 - (coverage * 0.5).fract() * 2.0).abs()
+        } else {
+            saturate(coverage)
+        }
+    }
+
+    /// Fills and strokes with straight, slanted and curved edges, rounded
+    /// corners, a hole, dashes and random outlines.
+    fn shapes() -> Vec<(String, Path)> {
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        let mut shapes = vec![("rectangle".to_string(), square(100., 40., 900., 600.))];
+        let mut add = |name: String, builder: PathBuilder| {
+            if let Ok(path) = builder.build() {
+                shapes.push((name, path));
+            }
+        };
+
+        let mut frame = PathBuilder::fill();
+        frame.add_polygon(
+            &[at(20., 20.), at(400., 20.), at(400., 300.), at(20., 300.)],
+            true,
+        );
+        frame.add_polygon(
+            &[at(60., 70.), at(350., 70.), at(350., 240.), at(60., 240.)],
+            true,
+        );
+        add("frame".to_string(), frame);
+
+        let mut rounded = PathBuilder::fill();
+        rounded.move_to(at(50., 40.));
+        rounded.line_to(at(450., 40.));
+        rounded.curve_to(at(460., 50.), at(460., 40.));
+        rounded.line_to(at(460., 130.));
+        rounded.curve_to(at(450., 140.), at(460., 140.));
+        rounded.line_to(at(50., 140.));
+        rounded.curve_to(at(40., 130.), at(40., 140.));
+        rounded.line_to(at(40., 50.));
+        rounded.curve_to(at(50., 40.), at(40., 40.));
+        add("rounded rectangle".to_string(), rounded);
+
+        let mut star = PathBuilder::fill();
+        let points: Vec<_> = (0..10)
+            .map(|index| {
+                let radius = if index % 2 == 0 { 200.0 } else { 80.0 };
+                let angle = index as f32 * std::f32::consts::PI / 5.0;
+                at(250. + radius * angle.sin(), 250. - radius * angle.cos())
+            })
+            .collect();
+        star.add_polygon(&points, true);
+        add("star".to_string(), star);
+
+        let mut stroke = PathBuilder::stroke(px(3.));
+        stroke.move_to(at(20., 30.));
+        stroke.line_to(at(400., 30.));
+        stroke.line_to(at(400., 300.));
+        stroke.line_to(at(90., 210.));
+        stroke.curve_to(at(300., 100.), at(60., 60.));
+        add("stroke".to_string(), stroke);
+
+        let mut dashes = PathBuilder::stroke(px(1.)).dash_array(&[px(4.), px(2.)]);
+        dashes.move_to(at(10., 10.5));
+        dashes.line_to(at(500., 10.5));
+        add("dashes".to_string(), dashes);
+
+        let mut seed = 0x9e37_79b9u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for index in 0..300 {
+            let extent = [40.0, 150.0, 600.0][index % 3];
+            let count = 3 + (random() * 6.0) as usize;
+            // Half the coordinates land on whole pixels, where pixel centers
+            // sit exactly half a pixel from an edge.
+            let mut coordinate = || {
+                let value = random() * extent;
+                if random() < 0.5 { value.round() } else { value }
+            };
+            let points: Vec<_> = (0..count)
+                .map(|_| {
+                    let x = coordinate();
+                    at(x, coordinate())
+                })
+                .collect();
+
+            let mut fill = PathBuilder::fill();
+            if index % 2 == 0 {
+                fill.add_polygon(&points, true);
+            } else {
+                fill.move_to(points[0]);
+                for pair in points[1..].chunks(2) {
+                    match pair {
+                        [control, to] => fill.curve_to(*to, *control),
+                        [to] => fill.line_to(*to),
+                        _ => {}
+                    }
+                }
+                fill.close();
+            }
+            add(format!("random fill {index}"), fill);
+
+            let mut stroke = PathBuilder::stroke(px(1.0 + random() * 6.0));
+            stroke.move_to(points[0]);
+            for to in &points[1..] {
+                stroke.line_to(*to);
+            }
+            add(format!("random stroke {index}"), stroke);
+        }
+        shapes
     }
 
     fn square(left: f32, top: f32, right: f32, bottom: f32) -> Path {

@@ -897,6 +897,9 @@ pub struct PathTile {
     pub top_left: Point<f32>,
     pub bottom_right: Point<f32>,
     pub reference: Point<f32>,
+    /// The box around the tile's curves. A pixel outside it is fully covered.
+    pub curves_top_left: Point<f32>,
+    pub curves_bottom_right: Point<f32>,
 }
 
 #[derive(Clone, Debug)]

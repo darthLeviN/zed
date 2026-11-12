@@ -1154,6 +1154,8 @@ struct PathTile {
     top_left: vec2<f32>,
     bottom_right: vec2<f32>,
     reference: vec2<f32>,
+    curves_top_left: vec2<f32>,
+    curves_bottom_right: vec2<f32>,
 }
 
 struct PathCurve {

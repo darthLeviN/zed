@@ -1044,6 +1044,9 @@ struct PathTile {
     float2 top_left;
     float2 bottom_right;
     float2 reference;
+    // The box around the tile's curves. A pixel outside it is fully covered.
+    float2 curves_top_left;
+    float2 curves_bottom_right;
 };
 
 struct PathPaint {
@@ -1058,16 +1061,12 @@ StructuredBuffer<PathTile> path_tiles: register(t1);
 StructuredBuffer<PathCurve> path_curves: register(t2);
 StructuredBuffer<PathPaint> path_paints: register(t3);
 
-// The distance the binner keeps between a tile's edge and the curves it doesn't list.
-static const float PATH_TILE_MARGIN = 0.5 + 1.0 / 256.0;
-
 struct PathTileFragmentInput {
     float4 position: SV_Position;
     // The curve start, curve count, backdrop and fill rule.
     nointerpolation uint4 tile: TEXCOORD0;
     nointerpolation float2 reference: TEXCOORD1;
     nointerpolation uint paint_id: TEXCOORD3;
-    // The bounds of the pixel centers that the tile's curves can affect.
     nointerpolation float4 curve_box: TEXCOORD4;
     PreparedBackground background;
 };
@@ -1093,22 +1092,8 @@ PathTileFragmentInput path_tile_vertex(uint vertex_id: SV_VertexID, uint tile_id
     output.tile = uint4(tile.curve_start, tile.curve_count, asuint(tile.backdrop), paint.even_odd);
     output.reference = tile.reference;
     output.paint_id = tile.paint;
+    output.curve_box = float4(tile.curves_top_left, tile.curves_bottom_right);
     output.background = prepare_background(paint.color);
-
-    // A tile only keeps area beyond its curves where that area is filled, so pixels outside
-    // this box need no curves. An empty box puts every pixel outside it.
-    float4 curve_box = float4(1e30, 1e30, -1e30, -1e30);
-    if (tile.curve_count > 8u) {
-        curve_box = float4(-1e30, -1e30, 1e30, 1e30);
-    } else {
-        [loop]
-        for (uint i = 0u; i < tile.curve_count; i++) {
-            PathCurve curve = path_curves[tile.curve_start + i];
-            curve_box.xy = min(curve_box.xy, min(curve.p0, curve.p1) - PATH_TILE_MARGIN);
-            curve_box.zw = max(curve_box.zw, max(curve.p0, curve.p1) + PATH_TILE_MARGIN);
-        }
-    }
-    output.curve_box = curve_box;
     return output;
 }
 
@@ -1128,35 +1113,43 @@ float monotone_quadratic_root(float a, float b, float c, float direction) {
 
 // Accumulates the curve's winding along the pixel's leftward and upward rays. Like Slug, a crossing
 // within half a pixel of the center counts fractionally.
-void add_curve_winding(PathCurve curve, float2 center, inout float2 winding, inout float2 weight) {
-    float min_x = min(curve.p0.x, curve.p1.x);
-    float max_x = max(curve.p0.x, curve.p1.x);
+// Curves run from `start` to `end` in the path's direction, so the endpoints alone say which way
+// a curve crosses each ray. Only a crossing within half a pixel needs the curve's coefficients.
+void add_curve_winding(float2 start, float2 end, uint curve_index, float2 center,
+                       inout float2 winding, inout float2 weight) {
+    float min_x = min(start.x, end.x);
+    float max_x = max(start.x, end.x);
+    float top = min(start.y, end.y);
+    float bottom = max(start.y, end.y);
+    float down = end.y < start.y ? -1.0 : 1.0;
+    float right = end.x > start.x ? 1.0 : -1.0;
 
     [branch]
-    if (curve.p0.y <= center.y && center.y < curve.p1.y) {
+    if (top <= center.y && center.y < bottom) {
         [branch]
         if (max_x <= center.x - 0.5) {
-            winding.x += curve.sign;
+            winding.x += down;
         } else {
-            float t = monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - center.y, 1.0);
-            float x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
+            PathCurve curve = path_curves[curve_index];
+            float t = monotone_quadratic_root(curve.a.y, curve.b.y, start.y - center.y, down);
+            float x = (curve.a.x * t + curve.b.x) * t + start.x;
             float distance = center.x - x;
-            winding.x += curve.sign * saturate(distance + 0.5);
+            winding.x += down * saturate(distance + 0.5);
             weight.x = max(weight.x, saturate(1.0 - 2.0 * abs(distance)));
         }
     }
 
     [branch]
     if (min_x <= center.x && center.x < max_x) {
-        float direction = curve.p1.x > curve.p0.x ? 1.0 : -1.0;
         [branch]
-        if (curve.p1.y <= center.y - 0.5) {
-            winding.y -= curve.sign * direction;
-        } else if (curve.p0.y < center.y + 0.5) {
-            float t = monotone_quadratic_root(curve.a.x, curve.b.x, curve.p0.x - center.x, direction);
-            float y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
+        if (bottom <= center.y - 0.5) {
+            winding.y -= right;
+        } else if (top < center.y + 0.5) {
+            PathCurve curve = path_curves[curve_index];
+            float t = monotone_quadratic_root(curve.a.x, curve.b.x, start.x - center.x, right);
+            float y = (curve.a.y * t + curve.b.y) * t + start.y;
             float distance = center.y - y;
-            winding.y -= curve.sign * direction * saturate(distance + 0.5);
+            winding.y -= right * saturate(distance + 0.5);
             weight.y = max(weight.y, saturate(1.0 - 2.0 * abs(distance)));
         }
     }
@@ -1190,14 +1183,15 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     float2 weight = float2(0.0, 0.0);
     [loop]
     for (uint i = 0u; i < curve_count; i++) {
-        PathCurve curve = path_curves[curve_start + i];
-        if (min(curve.p0.x, curve.p1.x) >= center.x + 0.5) {
+        float2 start = path_curves[curve_start + i].p0;
+        float2 end = path_curves[curve_start + i].p1;
+        if (min(start.x, end.x) >= center.x + 0.5) {
             break;
         }
-        if (curve.p0.y < center.y + 0.5) {
-            add_curve_winding(curve, center, winding, weight);
-            correct_for_endpoint(curve.p0, curve.sign, input.reference, center, winding);
-            correct_for_endpoint(curve.p1, -curve.sign, input.reference, center, winding);
+        if (min(start.y, end.y) < center.y + 0.5) {
+            add_curve_winding(start, end, curve_start + i, center, winding, weight);
+            correct_for_endpoint(start, 1.0, input.reference, center, winding);
+            correct_for_endpoint(end, -1.0, input.reference, center, winding);
         }
     }
 
