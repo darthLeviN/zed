@@ -12,8 +12,19 @@ cbuffer GlobalParams: register(b0) {
 
 cbuffer BatchParams: register(b1) {
     uint batch_start_index;
-    uint3 batch_pad;
+    // Measurement only: which part of the path fragment shader to switch off.
+    uint path_probe;
+    uint2 batch_pad;
 };
+
+static const uint PROBE_NORMAL = 0u;
+static const uint PROBE_FLOOR = 1u;
+static const uint PROBE_LOADS_ONLY = 2u;
+static const uint PROBE_NO_CORRECTIONS = 3u;
+static const uint PROBE_NO_ROOTS = 4u;
+static const uint PROBE_NO_CORNERS = 5u;
+static const uint PROBE_NO_EDGES = 6u;
+static const uint PROBE_NO_BOX = 7u;
 
 Texture2D<float4> t_sprite: register(t0);
 SamplerState s_sprite: register(s0);
@@ -1113,43 +1124,36 @@ float monotone_quadratic_root(float a, float b, float c, float direction) {
 
 // Accumulates the curve's winding along the pixel's leftward and upward rays. Like Slug, a crossing
 // within half a pixel of the center counts fractionally.
-// Curves run from `start` to `end` in the path's direction, so the endpoints alone say which way
-// a curve crosses each ray. Only a crossing within half a pixel needs the curve's coefficients.
-void add_curve_winding(float2 start, float2 end, uint curve_index, float2 center,
-                       inout float2 winding, inout float2 weight) {
-    float min_x = min(start.x, end.x);
-    float max_x = max(start.x, end.x);
-    float top = min(start.y, end.y);
-    float bottom = max(start.y, end.y);
-    float down = end.y < start.y ? -1.0 : 1.0;
-    float right = end.x > start.x ? 1.0 : -1.0;
+void add_curve_winding(PathCurve curve, float2 center, inout float2 winding, inout float2 weight) {
+    float min_x = min(curve.p0.x, curve.p1.x);
+    float max_x = max(curve.p0.x, curve.p1.x);
+    bool no_roots = path_probe == PROBE_NO_ROOTS;
 
     [branch]
-    if (top <= center.y && center.y < bottom) {
+    if (curve.p0.y <= center.y && center.y < curve.p1.y) {
         [branch]
-        if (max_x <= center.x - 0.5) {
-            winding.x += down;
+        if (no_roots || max_x <= center.x - 0.5) {
+            winding.x += curve.sign;
         } else {
-            PathCurve curve = path_curves[curve_index];
-            float t = monotone_quadratic_root(curve.a.y, curve.b.y, start.y - center.y, down);
-            float x = (curve.a.x * t + curve.b.x) * t + start.x;
+            float t = monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - center.y, 1.0);
+            float x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
             float distance = center.x - x;
-            winding.x += down * saturate(distance + 0.5);
+            winding.x += curve.sign * saturate(distance + 0.5);
             weight.x = max(weight.x, saturate(1.0 - 2.0 * abs(distance)));
         }
     }
 
     [branch]
     if (min_x <= center.x && center.x < max_x) {
+        float direction = curve.p1.x > curve.p0.x ? 1.0 : -1.0;
         [branch]
-        if (bottom <= center.y - 0.5) {
-            winding.y -= right;
-        } else if (top < center.y + 0.5) {
-            PathCurve curve = path_curves[curve_index];
-            float t = monotone_quadratic_root(curve.a.x, curve.b.x, start.x - center.x, right);
-            float y = (curve.a.y * t + curve.b.y) * t + start.y;
+        if (no_roots || curve.p1.y <= center.y - 0.5) {
+            winding.y -= curve.sign * direction;
+        } else if (curve.p0.y < center.y + 0.5) {
+            float t = monotone_quadratic_root(curve.a.x, curve.b.x, curve.p0.x - center.x, direction);
+            float y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
             float distance = center.y - y;
-            winding.y -= right * saturate(distance + 0.5);
+            winding.y -= curve.sign * direction * saturate(distance + 0.5);
             weight.y = max(weight.y, saturate(1.0 - 2.0 * abs(distance)));
         }
     }
@@ -1172,27 +1176,44 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     float2 center = floor(input.position.xy) + 0.5;
-    if (input.background.tag == 0u
+    uint curve_start = input.tile.x;
+    uint curve_count = input.tile.y;
+    if (path_probe == PROBE_FLOOR
+        || (path_probe == PROBE_NO_CORNERS && curve_count >= 3u)
+        || (path_probe == PROBE_NO_EDGES && curve_count >= 1u && curve_count < 3u)) {
+        return input.background.color0;
+    }
+    if (path_probe != PROBE_NO_BOX && input.background.tag == 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
         return input.background.color0;
     }
-    uint curve_start = input.tile.x;
-    uint curve_count = input.tile.y;
+    float loaded = 0.0;
 
     float2 winding = float(asint(input.tile.z));
     float2 weight = float2(0.0, 0.0);
     [loop]
     for (uint i = 0u; i < curve_count; i++) {
-        float2 start = path_curves[curve_start + i].p0;
-        float2 end = path_curves[curve_start + i].p1;
-        if (min(start.x, end.x) >= center.x + 0.5) {
+        PathCurve curve = path_curves[curve_start + i];
+        if (min(curve.p0.x, curve.p1.x) >= center.x + 0.5) {
             break;
         }
-        if (min(start.y, end.y) < center.y + 0.5) {
-            add_curve_winding(start, end, curve_start + i, center, winding, weight);
-            correct_for_endpoint(start, 1.0, input.reference, center, winding);
-            correct_for_endpoint(end, -1.0, input.reference, center, winding);
+        if (curve.p0.y < center.y + 0.5) {
+            [branch]
+            if (path_probe == PROBE_LOADS_ONLY) {
+                // Touch every word the full shader loads, and nothing else.
+                loaded += curve.a.x + curve.b.x + curve.sign;
+            } else {
+                add_curve_winding(curve, center, winding, weight);
+                [branch]
+                if (path_probe != PROBE_NO_CORRECTIONS) {
+                    correct_for_endpoint(curve.p0, curve.sign, input.reference, center, winding);
+                    correct_for_endpoint(curve.p1, -curve.sign, input.reference, center, winding);
+                }
+            }
         }
+    }
+    if (path_probe == PROBE_LOADS_ONLY) {
+        return loaded > 1e30 ? float4(0.0, 0.0, 0.0, 0.0) : input.background.color0;
     }
 
     // Weight the winding computed by each ray by its nearest crossing's distance from the pixel center,

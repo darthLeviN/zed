@@ -387,7 +387,7 @@ impl Binner {
                                 curves_bottom_right.x.fast_max(curve.max_x() + MARGIN);
                             curves_bottom_right.y =
                                 curves_bottom_right.y.fast_max(curve.p1.y + MARGIN);
-                            curves.push(curve.in_path_order());
+                            curves.push(*curve);
                         }
                         tiles.push(PathTile {
                             paint: 0,
@@ -623,21 +623,6 @@ impl PathCurve {
         }
     }
 
-    /// The curve as the shader reads it: from the point the path reaches first to the
-    /// one it reaches last, so that the endpoints alone give its direction.
-    fn in_path_order(&self) -> Self {
-        if self.sign < 0.0 {
-            Self {
-                p0: self.p1,
-                p1: self.p0,
-                b: point(-(2.0 * self.a.x + self.b.x), -(2.0 * self.a.y + self.b.y)),
-                ..*self
-            }
-        } else {
-            *self
-        }
-    }
-
     fn min_x(&self) -> f32 {
         self.p0.x.fast_min(self.p1.x)
     }
@@ -845,13 +830,7 @@ mod tests {
                 let binned = path.bin(scale);
                 for tile in binned.tiles() {
                     let start = tile.curve_start as usize;
-                    // The port below reads downward curves; converting again restores them.
-                    let list: Vec<PathCurve> = binned.curves()
-                        [start..start + tile.curve_count as usize]
-                        .iter()
-                        .map(|curve| curve.in_path_order())
-                        .collect();
-                    let list = &list;
+                    let list = &binned.curves()[start..start + tile.curve_count as usize];
                     let mut y = tile.top_left.y.floor() + 0.5;
                     while y < tile.bottom_right.y {
                         let mut x = tile.top_left.x.floor() + 0.5;

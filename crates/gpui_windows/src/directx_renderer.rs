@@ -425,7 +425,22 @@ impl DirectXRenderer {
                         .iter()
                         .map(PaintedPath::tile_count)
                         .sum::<usize>();
-                    self.draw_paths(tiles_start..path_tile_cursor)
+                    // Measurement only: draw the batch once per probe, so one capture
+                    // times each part of the path shader on the same tiles. The normal
+                    // shader runs first and last, to show how much two identical draws differ.
+                    let mut result = Ok(());
+                    for (probe, name) in PATH_PROBES {
+                        let _annotation = annotation.as_ref().map(|annotation| {
+                            Annotation::new(annotation, HSTRING::from(format!("paths {name}")))
+                        });
+                        PATH_PROBE.store(probe, std::sync::atomic::Ordering::Relaxed);
+                        result = self.draw_paths(tiles_start..path_tile_cursor);
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    PATH_PROBE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    result
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -1098,8 +1113,25 @@ struct GlobalParams {
 #[repr(C, align(16))]
 struct BatchParams {
     start_index: u32,
-    _padding: [u32; 3],
+    path_probe: u32,
+    _padding: [u32; 2],
 }
+
+/// Measurement only: the probe the path shader reads for the current draw.
+static PATH_PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Measurement only: each probe switches off one part of the path fragment shader.
+const PATH_PROBES: [(u32, &str); 9] = [
+    (0, "p0 normal first"),
+    (1, "p1 floor"),
+    (2, "p2 loads only"),
+    (3, "p3 no corrections"),
+    (4, "p4 no roots"),
+    (5, "p5 no corners"),
+    (6, "p6 no edges"),
+    (7, "p7 no box"),
+    (0, "p0 normal last"),
+];
 
 struct StructuredBuffer<T> {
     label: &'static str,
@@ -1680,7 +1712,8 @@ fn update_batch_start(
         buffer,
         &[BatchParams {
             start_index: first_instance,
-            _padding: [0; 3],
+            path_probe: PATH_PROBE.load(std::sync::atomic::Ordering::Relaxed),
+            _padding: [0; 2],
         }],
     )
 }
