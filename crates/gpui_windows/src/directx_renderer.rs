@@ -249,6 +249,9 @@ impl DirectXRenderer {
                 .VSSetConstantBuffers(1, Some(slice::from_ref(&self.globals.batch_params_buffer)));
             device_context
                 .PSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
+            // Measurement only: the path probe is read by the fragment shader.
+            device_context
+                .PSSetConstantBuffers(1, Some(slice::from_ref(&self.globals.batch_params_buffer)));
         }
         Ok(())
     }
@@ -429,7 +432,13 @@ impl DirectXRenderer {
                     // times each part of the path shader on the same tiles. The normal
                     // shader runs first and last, to show how much two identical draws differ.
                     let mut result = Ok(());
+                    let only = std::env::var("ZED_PATH_PROBE_ONLY")
+                        .ok()
+                        .and_then(|value| value.parse::<u32>().ok());
                     for (probe, name) in PATH_PROBES {
+                        if only.is_some_and(|only| only != probe) {
+                            continue;
+                        }
                         let _annotation = annotation.as_ref().map(|annotation| {
                             Annotation::new(annotation, HSTRING::from(format!("paths {name}")))
                         });
