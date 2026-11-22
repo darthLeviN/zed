@@ -21,7 +21,7 @@ const DEFAULT_UI_TEXT: &str = "Writing file";
 ///
 /// To make granular edits to an existing file, prefer the `edit_file` tool instead.
 ///
-/// Before overwriting an existing file, read it with `read_file` or `read_files`.
+/// Before overwriting an existing file, read it with `read_file`.
 /// Reads by another agent, internal snapshots, and previous writes do not qualify.
 /// Read the file again after writing it or if its buffer or disk contents change.
 ///
@@ -265,203 +265,6 @@ impl AgentTool for WriteFileTool {
     }
 }
 
-const MAX_WRITE_FILES: usize = 20;
-
-/// Create or overwrite 1–20 files in order using the same permissions and edit
-/// sessions as `write_file`. Existing files must first be read with `read_file`
-/// or `read_files`. Results are per-file; successful writes are not rolled back
-/// when another file fails. The complete batch is received before writing.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct WriteFilesToolInput {
-    #[schemars(length(min = 1, max = 20))]
-    pub files: Vec<WriteFileToolInput>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WriteFilesToolResult {
-    pub path: PathBuf,
-    pub success: bool,
-    pub output: EditSessionOutput,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WriteFilesToolOutput {
-    pub results: Vec<WriteFilesToolResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl WriteFilesToolOutput {
-    fn publish(&self, event_stream: &ToolCallEventStream) {
-        let mut content: Vec<acp::ToolCallContent> = Vec::new();
-        if let Some(error) = &self.error {
-            content.push(error.clone().into());
-        }
-        for result in &self.results {
-            content.push(
-                format!(
-                    "{}: {}: {}",
-                    result.path.display(),
-                    if result.success { "success" } else { "error" },
-                    result.output
-                )
-                .into(),
-            );
-            let diff = match &result.output {
-                EditSessionOutput::Success { diff, .. } | EditSessionOutput::Error { diff, .. } => {
-                    diff
-                }
-            };
-            if !diff.is_empty() {
-                content.push(
-                    util::markdown::MarkdownCodeBlock {
-                        tag: "diff",
-                        text: diff,
-                    }
-                    .to_string()
-                    .into(),
-                );
-            }
-        }
-        event_stream.update_fields(|update| update.content(content));
-    }
-}
-
-impl From<WriteFilesToolOutput> for language_model::LanguageModelToolResultContent {
-    fn from(output: WriteFilesToolOutput) -> Self {
-        let mut text = output.error.unwrap_or_default();
-        for result in output.results {
-            text.push_str(&format!(
-                "\n{}: {}: {}",
-                result.path.display(),
-                if result.success { "success" } else { "error" },
-                result.output
-            ));
-        }
-        text.into()
-    }
-}
-
-pub struct WriteFilesTool {
-    tool: Arc<WriteFileTool>,
-}
-
-impl WriteFilesTool {
-    pub fn new(
-        project: Entity<Project>,
-        thread: WeakEntity<Thread>,
-        action_log: Entity<ActionLog>,
-        language_registry: Arc<LanguageRegistry>,
-    ) -> Self {
-        Self {
-            tool: Arc::new(WriteFileTool::new(
-                project,
-                thread,
-                action_log,
-                language_registry,
-            )),
-        }
-    }
-}
-
-impl AgentTool for WriteFilesTool {
-    type Input = WriteFilesToolInput;
-    type Output = WriteFilesToolOutput;
-    const NAME: &'static str = "write_files";
-
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Edit
-    }
-
-    fn initial_title(
-        &self,
-        _input: Result<Self::Input, serde_json::Value>,
-        _cx: &mut App,
-    ) -> SharedString {
-        "Write files".into()
-    }
-
-    fn run(
-        self: Arc<Self>,
-        input: ToolInput<Self::Input>,
-        event_stream: ToolCallEventStream,
-        cx: &mut App,
-    ) -> Task<Result<Self::Output, Self::Output>> {
-        cx.spawn(async move |cx| {
-            let mut output = WriteFilesToolOutput {
-                results: Vec::new(),
-                error: None,
-            };
-            let input = match input.recv().await {
-                Ok(input) if (1..=MAX_WRITE_FILES).contains(&input.files.len()) => input,
-                Ok(_) => {
-                    output.error = Some(format!("write_files requires 1–{MAX_WRITE_FILES} files"));
-                    output.publish(&event_stream);
-                    return Err(output);
-                }
-                Err(error) => {
-                    output.error = Some(error.to_string());
-                    output.publish(&event_stream);
-                    return Err(output);
-                }
-            };
-            for file in input.files {
-                let path = file.path.clone();
-                let result = if event_stream.was_cancelled_by_user() {
-                    Err(EditSessionOutput::error("Write cancelled by user"))
-                } else {
-                    match serde_json::to_value(file) {
-                        Ok(value) => {
-                            cx.update(|cx| {
-                                self.tool.clone().run(
-                                    ToolInput::ready(value),
-                                    event_stream.clone(),
-                                    cx,
-                                )
-                            })
-                            .await
-                        }
-                        Err(error) => Err(EditSessionOutput::error(format!(
-                            "Failed to encode file write: {error}"
-                        ))),
-                    }
-                };
-                let success = result.is_ok();
-                let result = match result {
-                    Ok(output) | Err(output) => output,
-                };
-                output.results.push(WriteFilesToolResult {
-                    path,
-                    success,
-                    output: result,
-                });
-            }
-            output.publish(&event_stream);
-            if output.results.iter().all(|result| result.success) {
-                Ok(output)
-            } else {
-                Err(output)
-            }
-        })
-    }
-
-    fn replay(
-        &self,
-        _input: Self::Input,
-        output: Self::Output,
-        event_stream: ToolCallEventStream,
-        cx: &mut App,
-    ) -> anyhow::Result<()> {
-        output.publish(&event_stream);
-        for result in output.results {
-            self.tool
-                .session_context
-                .replay_output(result.output, event_stream.clone(), cx)?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,152 +394,65 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_write_files_creation_does_not_authorize_overwrite(cx: &mut TestAppContext) {
-        let (_tool, project, action_log, fs, thread) = setup_test(cx, json!({})).await;
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let tool = Arc::new(WriteFilesTool::new(
-            project,
-            thread.downgrade(),
-            action_log,
-            languages,
-        ));
-        let output = cx
-            .update(|cx| {
-                tool.run(
-                    ToolInput::resolved(WriteFilesToolInput {
-                        files: vec![
-                            WriteFileToolInput {
-                                path: "root/new.txt".into(),
-                                content: "created".into(),
-                            },
-                            WriteFileToolInput {
-                                path: "root/new.txt".into(),
-                                content: "not read".into(),
-                            },
-                        ],
-                    }),
-                    ToolCallEventStream::test().0,
-                    cx,
-                )
-            })
-            .await
-            .expect_err("create is not a read");
-        assert!(output.results[0].success);
-        assert!(!output.results[1].success);
-        assert!(
-            output.results[1]
-                .output
-                .to_string()
-                .contains("no actual read")
-        );
-        assert_eq!(
-            fs.load(path!("/root/new.txt").as_ref())
-                .await
-                .expect("created content"),
-            "created"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_write_files_partial_failure_requires_read(cx: &mut TestAppContext) {
-        let (_tool, project, action_log, fs, thread) =
-            setup_test(cx, json!({"existing.txt": "original", "dir": {}})).await;
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let tool = Arc::new(WriteFilesTool::new(
-            project,
-            thread.downgrade(),
-            action_log,
-            languages,
-        ));
-        let output = cx
-            .update(|cx| {
-                tool.run(
-                    ToolInput::resolved(WriteFilesToolInput {
-                        files: vec![
-                            WriteFileToolInput {
-                                path: "root/existing.txt".into(),
-                                content: "must not overwrite".into(),
-                            },
-                            WriteFileToolInput {
-                                path: "root/dir/new.txt".into(),
-                                content: "created".into(),
-                            },
-                            WriteFileToolInput {
-                                path: "root/missing/new.txt".into(),
-                                content: "invalid".into(),
-                            },
-                        ],
-                    }),
-                    ToolCallEventStream::test().0,
-                    cx,
-                )
-            })
-            .await
-            .expect_err("partial failure");
-        assert_eq!(output.results.len(), 3);
-        assert!(!output.results[0].success);
-        assert!(output.results[0].output.to_string().contains("read_file"));
-        assert!(output.results[1].success);
-        assert!(!output.results[2].success);
-        assert_eq!(
-            fs.load(path!("/root/existing.txt").as_ref()).await.unwrap(),
-            "original"
-        );
-        assert_eq!(
-            fs.load(path!("/root/dir/new.txt").as_ref()).await.unwrap(),
-            "created"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_write_files_after_read(cx: &mut TestAppContext) {
-        let (_tool, project, action_log, fs, thread) =
-            setup_test(cx, json!({"existing.txt": "original"})).await;
-        let read_tool = Arc::new(super::super::read_file_tool::ReadFileTool::new(
-            project.clone(),
-            action_log.clone(),
-            false,
-        ));
+    async fn test_created_file_requires_read_before_overwrite(cx: &mut TestAppContext) {
+        let (tool, project, action_log, fs, _thread) = setup_test(cx, json!({})).await;
         cx.update(|cx| {
-            read_tool.run(
-                ToolInput::resolved(super::super::read_file_tool::ReadFileToolInput {
-                    path: "root/existing.txt".into(),
-                    start_line: None,
-                    end_line: None,
+            tool.clone().run(
+                ToolInput::resolved(WriteFileToolInput {
+                    path: "root/new.txt".into(),
+                    content: "created".into(),
                 }),
                 ToolCallEventStream::test().0,
                 cx,
             )
         })
         .await
-        .expect("read succeeds");
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let tool = Arc::new(WriteFilesTool::new(
-            project.clone(),
-            thread.downgrade(),
-            action_log.clone(),
-            languages,
-        ));
+        .expect("create file");
         let output = cx
             .update(|cx| {
                 tool.clone().run(
-                    ToolInput::resolved(WriteFilesToolInput {
-                        files: vec![WriteFileToolInput {
-                            path: "root/existing.txt".into(),
-                            content: "updated".into(),
-                        }],
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/new.txt".into(),
+                        content: "unread overwrite".into(),
                     }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
             })
             .await
-            .expect("tracked overwrite");
-        assert!(output.results[0].success);
+            .expect_err("creation does not count as reading");
+        assert!(output.to_string().contains("no actual read"));
         assert_eq!(
-            fs.load(path!("/root/existing.txt").as_ref()).await.unwrap(),
-            "updated"
+            fs.load(path!("/root/new.txt").as_ref())
+                .await
+                .expect("created file"),
+            "created"
         );
+        read_before_write(&project, &action_log, "root/new.txt", cx).await;
+        cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(WriteFileToolInput {
+                    path: "root/new.txt".into(),
+                    content: "read overwrite".into(),
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .expect("read permits overwrite");
+        assert_eq!(
+            fs.load(path!("/root/new.txt").as_ref())
+                .await
+                .expect("updated file"),
+            "read overwrite"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_write_file_rejects_stale_read(cx: &mut TestAppContext) {
+        let (tool, project, action_log, fs, _thread) =
+            setup_test(cx, json!({"existing.txt": "original"})).await;
         read_before_write(&project, &action_log, "root/existing.txt", cx).await;
         fs.save(
             path!("/root/existing.txt").as_ref(),
@@ -748,56 +464,23 @@ mod tests {
         let output = cx
             .update(|cx| {
                 tool.run(
-                    ToolInput::resolved(WriteFilesToolInput {
-                        files: vec![WriteFileToolInput {
-                            path: "root/existing.txt".into(),
-                            content: "stale overwrite".into(),
-                        }],
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/existing.txt".into(),
+                        content: "stale overwrite".into(),
                     }),
                     ToolCallEventStream::test().0,
                     cx,
                 )
             })
             .await
-            .expect_err("stale read");
-        assert!(output.results[0].output.to_string().contains("changed"));
+            .expect_err("stale read must not permit overwrite");
+        assert!(output.to_string().contains("changed"));
         assert_eq!(
-            fs.load(path!("/root/existing.txt").as_ref()).await.unwrap(),
+            fs.load(path!("/root/existing.txt").as_ref())
+                .await
+                .expect("externally changed file"),
             "external change"
         );
-    }
-
-    #[gpui::test]
-    async fn test_write_files_batch_limits(cx: &mut TestAppContext) {
-        let (_tool, project, action_log, fs, thread) = setup_test(cx, json!({})).await;
-        let languages = project.read_with(cx, |project, _| project.languages().clone());
-        let tool = Arc::new(WriteFilesTool::new(
-            project,
-            thread.downgrade(),
-            action_log,
-            languages,
-        ));
-        for count in [0, MAX_WRITE_FILES + 1] {
-            let files = (0..count)
-                .map(|_| WriteFileToolInput {
-                    path: "root/new.txt".into(),
-                    content: "never written".into(),
-                })
-                .collect();
-            let output = cx
-                .update(|cx| {
-                    tool.clone().run(
-                        ToolInput::resolved(WriteFilesToolInput { files }),
-                        ToolCallEventStream::test().0,
-                        cx,
-                    )
-                })
-                .await
-                .expect_err("invalid batch size");
-            assert!(output.results.is_empty());
-            assert!(output.error.is_some());
-            assert!(!fs.is_file(path!("/root/new.txt").as_ref()).await);
-        }
     }
 
     #[gpui::test]

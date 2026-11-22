@@ -223,7 +223,6 @@ tools! {
     ListDirectoryTool,
     MovePathTool,
     ReadFileTool,
-    ReadFilesTool,
     RenameTool,
     SkillTool,
     SpawnAgentTool,
@@ -231,7 +230,6 @@ tools! {
     TerminalTool,
     WebSearchTool,
     WriteFileTool,
-    WriteFilesTool,
 }
 
 /// Some built-in tools are gated behind a feature flag and only become usable
@@ -256,6 +254,16 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_tools_use_individual_calls_without_batch_wrappers() {
+        assert!(ALL_TOOL_NAMES.contains(&ReadFileTool::NAME));
+        assert!(ALL_TOOL_NAMES.contains(&WriteFileTool::NAME));
+        for removed_tool in ["read_files", "write_files"] {
+            assert!(!ALL_TOOL_NAMES.contains(&removed_tool));
+            assert!(!built_in_tools().any(|tool| tool.name == removed_tool));
+        }
+    }
 
     #[test]
     fn built_in_tool_schemas_are_normalized() {

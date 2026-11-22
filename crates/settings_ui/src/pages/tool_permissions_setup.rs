@@ -1417,15 +1417,13 @@ mod tests {
             "list_directory",
             "open",
             "read_file",
-            "read_files",
             "conversation",
             "rename_symbol",
             "thinking",
             // streaming_edit_file uses "edit_file" for permission lookups,
             // so its rules are configured under the edit_file entry.
             "streaming_edit_file",
-            // Batch writes and queued commands reuse write_file and terminal permissions.
-            "write_files",
+            // Queued commands reuse terminal permissions.
             "build_queue",
             // Sibling/subagent thread creation delegates permission checks to
             // tool calls inside the spawned thread, not the spawning itself.

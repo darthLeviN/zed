@@ -2439,12 +2439,6 @@ impl Thread {
             self.project.clone(),
             cx.weak_entity(),
             self.action_log.clone(),
-            language_registry.clone(),
-        ));
-        self.add_tool(crate::WriteFilesTool::new(
-            self.project.clone(),
-            cx.weak_entity(),
-            self.action_log.clone(),
             language_registry,
         ));
         self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
@@ -2457,11 +2451,7 @@ impl Thread {
             self.action_log.clone(),
             update_agent_location,
         ));
-        self.add_tool(crate::ReadFilesTool::new(
-            self.project.clone(),
-            self.action_log.clone(),
-            update_agent_location,
-        ));
+
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
@@ -5854,7 +5844,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
         })
     }
 
-    pub(crate) fn cast<U: DeserializeOwned>(self) -> ToolInput<U> {
+    fn cast<U: DeserializeOwned>(self) -> ToolInput<U> {
         ToolInput {
             rx: self.rx,
             activity: self.activity,

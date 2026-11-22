@@ -53,18 +53,6 @@ Lists files and directories in a given path, providing an overview of filesystem
 
 Reads the content of a specified file in the project, allowing access to file contents.
 
-### `read_files`
-
-Reads 1–20 files in one call. Each entry accepts the same `path`, `start_line`, and `end_line` fields as `read_file`. Results stay in request order, including image content and individual errors. One failed read does not discard successful reads.
-
-```json
-{
-  "files": [
-    { "path": "my-project/src/parser.rs", "start_line": 1, "end_line": 80 },
-    { "path": "my-project/src/config.rs" }
-  ]
-}
-```
 
 ### `conversation`
 
@@ -108,11 +96,7 @@ Moves or renames a file or directory in the project, performing a rename if only
 
 Creates a new file or overwrites an existing file with completely new contents.
 
-### `write_files`
-
-Creates or overwrites 1–20 files in one call, using a `files` array of `path` and `content` objects. Files are processed in order, with the same permissions and review flow as `write_file`. Results report each success or error separately. This is not an atomic transaction: successful writes remain if another file fails.
-
-Overwriting an existing file with either write tool requires a successful read in the same agent thread. Forwarded startup snapshots and conversation-history results do not satisfy this requirement. Read again if the file changes or after overwriting it. Creating a new file does not require a prior read.
+Overwriting an existing file requires a successful read in the same agent thread. Forwarded startup snapshots and conversation-history results do not satisfy this requirement. Read again if the file changes or after overwriting it. Creating a new file does not require a prior read.
 
 ### `terminal`
 

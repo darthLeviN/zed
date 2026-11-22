@@ -1090,7 +1090,7 @@ async fn require_actual_read_for_overwrite(
             }
             mtime
         } else {
-            return Err(format!("Cannot overwrite {}: read the existing file with read_file or read_files first (no actual read tracked for this agent)", abs_path.display()));
+            return Err(format!("Cannot overwrite {}: read the existing file with read_file first (no actual read tracked for this agent)", abs_path.display()));
         };
         if let Some(metadata) = &local_metadata
             && metadata.mtime != last_read
