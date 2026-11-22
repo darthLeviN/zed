@@ -13,6 +13,7 @@ pub struct QueueEntry {
     /// instead of waiting for generation to fully complete. Only the front
     /// entry's value matters, since messages are delivered in FIFO order.
     pub steer: bool,
+    pub independent_subagent_request: bool,
     pub editor: Entity<MessageEditor>,
     pub _subscription: Subscription,
 }
@@ -72,6 +73,12 @@ impl MessageQueue {
     /// boundary. Drives the native thread's boundary flag.
     pub fn front_wants_steer(&self) -> bool {
         self.entries.front().is_some_and(|entry| entry.steer)
+    }
+
+    pub fn front_wants_independent_subagent_request(&self) -> bool {
+        self.entries
+            .front()
+            .is_some_and(|entry| entry.independent_subagent_request)
     }
 
     pub fn toggle_steer(&mut self, id: QueueEntryId) {
@@ -140,13 +147,17 @@ impl MessageQueue {
     /// action, distinct from auto-processing. If a generation is in flight,
     /// the dispatch will cancel it, so we must absorb that cancellation's
     /// Stopped event to avoid double-sending the next entry.
-    pub fn try_fast_track(&mut self, is_generating: bool) -> Option<QueueEntry> {
-        if !self.can_fast_track {
+    pub fn try_fast_track(
+        &mut self,
+        is_generating: bool,
+        is_independent_subagent_request: bool,
+    ) -> Option<QueueEntry> {
+        if !self.can_fast_track || (is_generating && is_independent_subagent_request) {
             return None;
         }
         self.can_fast_track = false;
         let entry = self.entries.pop_front()?;
-        self.processing_state = if is_generating {
+        self.processing_state = if is_generating && !is_independent_subagent_request {
             ProcessingState::AbsorbingCancel
         } else {
             ProcessingState::AutoProcess
@@ -185,12 +196,15 @@ impl MessageQueue {
         }
     }
 
-    /// Removes an entry for an explicit "Send Now". If a generation is in
-    /// flight, the dispatch will cancel it, so we must absorb that
-    /// cancellation's Stopped event.
-    pub fn send_now(&mut self, id: QueueEntryId, is_generating: bool) -> Option<QueueEntry> {
+    /// Removes an entry for an explicit "Send Now". Absorb a Stopped event
+    /// only when dispatching the entry will cancel the current generation.
+    pub fn send_now(
+        &mut self,
+        id: QueueEntryId,
+        will_cancel_generation: bool,
+    ) -> Option<QueueEntry> {
         let entry = self.remove(id)?;
-        if is_generating {
+        if will_cancel_generation {
             self.processing_state = ProcessingState::AbsorbingCancel;
         }
         Some(entry)

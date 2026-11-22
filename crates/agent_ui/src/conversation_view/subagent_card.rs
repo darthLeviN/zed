@@ -19,6 +19,7 @@ pub(crate) enum SubagentCardId {
     ToolCall(acp_v2::ToolCallId),
     /// An ACP parent's outgoing session message to the subagent.
     SessionMessage(acp_v2::MessageId),
+    CoordinatedToolCall(acp_v2::ToolCallId, acp_v2::SessionId),
 }
 
 impl fmt::Display for SubagentCardId {
@@ -26,6 +27,9 @@ impl fmt::Display for SubagentCardId {
         match self {
             Self::ToolCall(id) => write!(f, "tool-call-{id}"),
             Self::SessionMessage(id) => write!(f, "session-message-{id}"),
+            Self::CoordinatedToolCall(tool_call_id, session_id) => {
+                write!(f, "coordinated-tool-call-{tool_call_id}-{session_id}")
+            }
         }
     }
 }
@@ -253,6 +257,58 @@ impl SubagentCardState {
         }
     }
 
+    /// Builds one card from coordinated-call metadata, preferring the child's live state
+    /// while the parent still reports the child as running.
+    pub(crate) fn from_coordinated_tool_call(
+        card: &acp_thread::SubagentSessionCard,
+        subagent: Option<&AcpThread>,
+    ) -> Self {
+        let reported_status = match card.status {
+            acp_thread::SubagentSessionCardStatus::Running => SubagentStatus::Running,
+            acp_thread::SubagentSessionCardStatus::Completed => SubagentStatus::Completed,
+            acp_thread::SubagentSessionCardStatus::Failed => SubagentStatus::Failed,
+            acp_thread::SubagentSessionCardStatus::Canceled => SubagentStatus::Canceled,
+        };
+        let outcome = subagent.and_then(|thread| {
+            thread.subagent_outcome_boundary_after(card.session_info.message_start_index)
+        });
+        let (status, error) = if reported_status == SubagentStatus::Running {
+            if let Some((_, outcome)) = outcome {
+                SubagentStatus::from_reported_state(Some(outcome))
+            } else {
+                (SubagentStatus::Running, None)
+            }
+        } else {
+            (
+                reported_status,
+                card.error
+                    .as_deref()
+                    .filter(|error| !error.is_empty())
+                    .map(Into::into),
+            )
+        };
+        let entries = Some(SubagentEntries {
+            start: card.session_info.message_start_index,
+            end: card
+                .session_info
+                .message_end_index
+                .or_else(|| outcome.and_then(|(entry_count, _)| entry_count.checked_sub(1))),
+        });
+        Self {
+            label: Some(card.label.clone().into()),
+            label_wins: true,
+            status,
+            error,
+            can_stop: status == SubagentStatus::Running
+                && subagent.is_some_and(|thread| {
+                    thread
+                        .subagent_association()
+                        .is_some_and(|association| association.can_cancel)
+                }),
+            entries,
+        }
+    }
+
     /// Builds the card for an ACP subagent, covering `entries` of its transcript or all of
     /// it. The subagent reports one state for all its work, so a card for an earlier message
     /// shows the first outcome the subagent reported after receiving it. Until then, that
@@ -358,6 +414,100 @@ mod tests {
             can_stop: false,
             entries,
         }
+    }
+
+    #[test]
+    fn coordinated_cards_keep_independent_statuses_ranges_and_ids() {
+        let make_card = |session_id: &str, label: &str, status| acp_thread::SubagentSessionCard {
+            session_info: acp_thread::SubagentSessionInfo {
+                session_id: acp_v2::SessionId::new(session_id),
+                message_start_index: 2,
+                message_end_index: Some(4),
+            },
+            label: label.to_string(),
+            status,
+            error: None,
+        };
+        let completed = make_card(
+            "completed-child",
+            "Research",
+            acp_thread::SubagentSessionCardStatus::Completed,
+        );
+        let running = make_card(
+            "running-child",
+            "Implement",
+            acp_thread::SubagentSessionCardStatus::Running,
+        );
+        let completed_state = SubagentCardState::from_coordinated_tool_call(&completed, None);
+        let running_state = SubagentCardState::from_coordinated_tool_call(&running, None);
+
+        assert_eq!(completed_state.status, SubagentStatus::Completed);
+        assert_eq!(running_state.status, SubagentStatus::Running);
+        assert_eq!(completed_state.label.as_deref(), Some("Research"));
+        assert_eq!(running_state.label.as_deref(), Some("Implement"));
+        assert_eq!(completed_state.entries, running_state.entries);
+        assert!(!completed_state.can_stop);
+        assert!(!running_state.can_stop);
+
+        let tool_call_id = acp_v2::ToolCallId::new("coordinate");
+        let completed_id = SubagentCardId::CoordinatedToolCall(
+            tool_call_id.clone(),
+            completed.session_info.session_id,
+        );
+        let running_id =
+            SubagentCardId::CoordinatedToolCall(tool_call_id, running.session_info.session_id);
+        assert_ne!(completed_id, running_id);
+    }
+
+    #[test]
+    fn coordinated_cards_survive_metadata_replay() {
+        let cards = vec![
+            acp_thread::SubagentSessionCard {
+                session_info: acp_thread::SubagentSessionInfo {
+                    session_id: acp_v2::SessionId::new("completed-child"),
+                    message_start_index: 1,
+                    message_end_index: Some(3),
+                },
+                label: "Research".to_string(),
+                status: acp_thread::SubagentSessionCardStatus::Completed,
+                error: None,
+            },
+            acp_thread::SubagentSessionCard {
+                session_info: acp_thread::SubagentSessionInfo {
+                    session_id: acp_v2::SessionId::new("running-child"),
+                    message_start_index: 4,
+                    message_end_index: None,
+                },
+                label: "Implement".to_string(),
+                status: acp_thread::SubagentSessionCardStatus::Running,
+                error: None,
+            },
+        ];
+        let serialized = serde_json::to_value(&cards).expect("serialize coordinated cards");
+        let meta = Some(acp_v2::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_CARDS_META_KEY.into(),
+            serialized,
+        )]));
+        let replayed = acp_thread::subagent_session_cards_from_meta(&meta);
+
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(
+            replayed[0].session_info.session_id,
+            acp_v2::SessionId::new("completed-child")
+        );
+        assert!(matches!(
+            replayed[0].status,
+            acp_thread::SubagentSessionCardStatus::Completed
+        ));
+        assert_eq!(
+            replayed[1].session_info.session_id,
+            acp_v2::SessionId::new("running-child")
+        );
+        assert!(matches!(
+            replayed[1].status,
+            acp_thread::SubagentSessionCardStatus::Running
+        ));
+        assert_eq!(replayed[1].session_info.message_end_index, None);
     }
 
     #[test]

@@ -6067,6 +6067,7 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     message: "prompt".to_string(),
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -6100,6 +6101,7 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     message: "prompt".to_string(),
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -6170,6 +6172,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6319,6 +6322,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6478,6 +6482,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6616,6 +6621,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the first task".to_string(),
         session_id: None,
         model: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6688,6 +6694,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        ..Default::default()
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -7646,6 +7653,148 @@ async fn test_subagent_parent_cancellation_before_acceptance(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+async fn test_prepared_subagent_cancellation_before_send_is_polled(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = cx.update(|cx| {
+        test.handle.prepare_send(cx).expect("prepare subagent");
+        test.handle.send("prompt".into(), &cx.to_async())
+    });
+    test.parent.update(cx, |thread, cx| thread.cancel(cx)).await;
+    cx.run_until_parked();
+    assert!(test.fake.pending_completions().is_empty());
+    assert_eq!(
+        send.await.expect_err("cancelled").to_string(),
+        "User canceled"
+    );
+    test.assert_stopped(cx);
+}
+
+#[gpui::test]
+async fn test_native_idle_parent_cancellation_stops_subagent(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let connection = Rc::new(NativeAgentConnection(test._agent.clone()));
+    let parent_turn = cx.update(|cx| {
+        connection.send_and_wait_for_completion(
+            test._acp_thread.clone(),
+            vec!["parent prompt".into()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let request = test
+        .fake
+        .pending_completions_for(&test.model)
+        .pop()
+        .expect("parent request");
+    test.fake
+        .send_text(&test.model, &request, "parent completed");
+    test.fake.end_stream(&test.model, &request);
+    parent_turn.await.expect("parent completes");
+    cx.run_until_parked();
+    let parent_id = test.parent.read_with(cx, |thread, _| thread.id().clone());
+    test._agent.read_with(cx, |agent, _| {
+        assert!(
+            agent
+                .sessions
+                .get(&parent_id)
+                .expect("parent session")
+                .execution
+                .as_ref()
+                .expect("completed execution is retained")
+                .completion
+                .peek()
+                .is_some()
+        );
+    });
+    let send = test.send("subagent prompt", cx);
+    assert!(
+        test.parent
+            .read_with(cx, |thread, _| thread.is_turn_complete())
+    );
+    assert!(!test.fake.pending_completions().is_empty());
+    let parent_id = test.parent.read_with(cx, |thread, _| thread.id().clone());
+    test._agent
+        .update(cx, |agent, cx| agent.cancel_session(&parent_id, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        send.await.expect_err("cancelled").to_string(),
+        "User canceled"
+    );
+    test.assert_stopped(cx);
+}
+
+#[gpui::test]
+async fn test_group_parent_cancellation_while_parent_idle(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let environment = Rc::new(NativeThreadEnvironment {
+        agent: test._agent.downgrade(),
+        thread: test.parent.downgrade(),
+        acp_thread: test._acp_thread.downgrade(),
+    });
+    let tool = cx.update(|cx| {
+        Arc::new(crate::SubagentsTool::new(environment).with_parent(test.parent.clone(), cx))
+    });
+    let spawned = cx
+        .update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(crate::SubagentsToolInput::SpawnGroups {
+                    groups: vec![vec![
+                        SpawnAgentToolInput {
+                            label: "first".into(),
+                            message: "first prompt".into(),
+                            ..Default::default()
+                        },
+                        SpawnAgentToolInput {
+                            label: "second".into(),
+                            message: "second prompt".into(),
+                            ..Default::default()
+                        },
+                    ]],
+                    wait_timeout_ms: Some(0),
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .expect("spawn group");
+    cx.run_until_parked();
+    assert!(
+        test.parent
+            .read_with(cx, |thread, _| thread.is_turn_complete())
+    );
+    let parent_id = test.parent.read_with(cx, |thread, _| thread.id().clone());
+    test._agent
+        .update(cx, |agent, cx| agent.cancel_session(&parent_id, cx));
+    cx.run_until_parked();
+    let waited = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(crate::SubagentsToolInput::Wait {
+                    group_id: spawned.0["group_ids"][0]
+                        .as_str()
+                        .expect("group id")
+                        .to_owned(),
+                    mode: crate::SubagentWaitMode::All,
+                    wait_timeout_ms: Some(0),
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .expect("wait for cancelled group");
+    assert_eq!(waited.0["remaining"], json!([]));
+    let finished = waited.0["finished"].as_array().expect("finished jobs");
+    assert_eq!(finished.len(), 2);
+    assert!(
+        finished
+            .iter()
+            .all(|job| job["status"] == "failed" && job["error"] == "User canceled")
+    );
+}
+
+#[gpui::test]
 async fn test_subagent_compaction_parent_cancellation(cx: &mut TestAppContext) {
     let test = SubagentCompactionTest::new(cx).await;
     let send = test.send("subagent task prompt", cx);
@@ -7753,6 +7902,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

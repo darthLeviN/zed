@@ -1,6 +1,8 @@
 mod apply_code_action_tool;
 mod ask_user_tool;
+mod build_queue_tool;
 mod context_server_registry;
+mod conversation_tool;
 mod copy_path_tool;
 mod create_directory_tool;
 mod create_thread_tool;
@@ -23,6 +25,7 @@ mod read_file_tool;
 mod rename_tool;
 mod skill_tool;
 mod spawn_agent_tool;
+mod subagent_tools;
 mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
@@ -72,7 +75,9 @@ where
 
 pub use apply_code_action_tool::*;
 pub use ask_user_tool::*;
+pub use build_queue_tool::*;
 pub use context_server_registry::*;
+pub use conversation_tool::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
 pub use create_thread_tool::*;
@@ -92,6 +97,7 @@ pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
+pub use subagent_tools::*;
 pub use symbol_locator::*;
 
 pub use terminal_tool::*;
@@ -199,6 +205,8 @@ macro_rules! tools {
 tools! {
     ApplyCodeActionTool,
     AskUserTool,
+    BuildQueueTool,
+    ConversationTool,
     CopyPathTool,
     CreateDirectoryTool,
     CreateThreadTool,
@@ -215,12 +223,15 @@ tools! {
     ListDirectoryTool,
     MovePathTool,
     ReadFileTool,
+    ReadFilesTool,
     RenameTool,
     SkillTool,
     SpawnAgentTool,
+    SubagentsTool,
     TerminalTool,
     WebSearchTool,
     WriteFileTool,
+    WriteFilesTool,
 }
 
 /// Some built-in tools are gated behind a feature flag and only become usable
@@ -278,9 +289,12 @@ mod tests {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
 
+        assert!(!tool_allowed_in_restricted_mode(BuildQueueTool::NAME));
+
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
-            let expected = *name != FetchTool::NAME && *name != TerminalTool::NAME;
+            let expected =
+                ![FetchTool::NAME, TerminalTool::NAME, BuildQueueTool::NAME].contains(name);
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

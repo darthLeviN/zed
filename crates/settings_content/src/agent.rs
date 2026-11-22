@@ -217,6 +217,24 @@ pub struct AutoCompactSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
+    /// Enable the same-user host-wide FIFO build queue tool. Available without configuration.
+    /// Only global settings apply. Only explicit build_queue calls are serialized;
+    /// ordinary terminal calls are unchanged.
+    ///
+    /// Default: true
+    pub build_queue_enabled: Option<bool>,
+    /// Default job deadline for queued builds, in milliseconds, excluding queue wait.
+    /// Starts at slot acquisition and includes authorization, sandbox preparation, terminal startup,
+    /// and command execution. Termination gets an additional five-second grace period.
+    /// Must be positive and no greater than build_queue_max_timeout_ms. Only global settings apply.
+    ///
+    /// Default: 600000
+    pub build_queue_default_timeout_ms: Option<u64>,
+    /// Maximum job deadline for queued builds, in milliseconds. Must be positive.
+    /// Only global settings apply; projects cannot raise this limit.
+    ///
+    /// Default: 3600000
+    pub build_queue_max_timeout_ms: Option<u64>,
     /// Whether the Agent is enabled.
     ///
     /// Default: true
@@ -1162,6 +1180,30 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_queue_settings_are_optional_and_merge_independently() {
+        let mut content: AgentSettingsContent =
+            serde_json::from_str("{}").expect("empty agent settings");
+        assert_eq!(content.build_queue_enabled, None);
+        assert_eq!(content.build_queue_default_timeout_ms, None);
+        assert_eq!(content.build_queue_max_timeout_ms, None);
+        let global: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+            "build_queue_enabled": true,
+            "build_queue_default_timeout_ms": 600000,
+            "build_queue_max_timeout_ms": 3600000,
+        }))
+        .expect("global build queue settings");
+        content.merge_from(&global);
+        let override_content: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+            "build_queue_default_timeout_ms": 1000,
+        }))
+        .expect("partial build queue settings");
+        content.merge_from(&override_content);
+        assert_eq!(content.build_queue_enabled, Some(true));
+        assert_eq!(content.build_queue_default_timeout_ms, Some(1000));
+        assert_eq!(content.build_queue_max_timeout_ms, Some(3600000));
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {

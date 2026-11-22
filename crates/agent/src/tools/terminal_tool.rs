@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -414,6 +414,196 @@ fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
     None
 }
 
+const BUILD_KILL_GRACE: Duration = Duration::from_secs(5);
+
+pub(crate) struct QueuedTerminalResult {
+    pub result: Result<String, String>,
+    pub cleanup: Option<Task<()>>,
+}
+
+pub(crate) async fn run_queued_terminal_tool(
+    project: Entity<Project>,
+    environment: Rc<dyn ThreadEnvironment>,
+    input: SandboxedTerminalToolInput,
+    event_stream: ToolCallEventStream,
+    cancellation: futures::channel::oneshot::Receiver<()>,
+    started_at: Instant,
+    cx: &mut AsyncApp,
+) -> QueuedTerminalResult {
+    if !cfg!(target_os = "linux") || cx.update(|cx| !project.read(cx).is_local()) {
+        return QueuedTerminalResult {
+            result: Err(
+                "Queue process-group completion currently requires a local Linux terminal. Commands must not daemonize, call setsid, or create separate job-control process groups.".into(),
+            ),
+            cleanup: None,
+        };
+    }
+    let timeout_ms = match cx.update(|cx| {
+        agent_settings::AgentSettings::get_global(cx).build_queue_timeout_ms(input.timeout_ms)
+    }) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => {
+            return QueuedTerminalResult {
+                result: Err(error.to_string()),
+                cleanup: None,
+            };
+        }
+    };
+    let elapsed = cx
+        .background_executor()
+        .now()
+        .saturating_duration_since(started_at);
+    let budget = Duration::from_millis(timeout_ms);
+    if elapsed >= budget {
+        return QueuedTerminalResult {
+            result: Err("Build timed out before authorization or startup could begin.".into()),
+            cleanup: None,
+        };
+    }
+    let deadline = cx.background_executor().timer(budget - elapsed);
+    let (stop_sender, stop_receiver) = futures::channel::oneshot::channel();
+    let events = event_stream.clone();
+    let mut job = cx.spawn(async move |cx| {
+        let mut cleanup = None;
+        let result = run_terminal_tool_inner(
+            project,
+            environment,
+            input.into(),
+            events,
+            Some(stop_receiver),
+            &mut cleanup,
+            cx,
+        )
+        .await;
+        QueuedTerminalResult {
+            result: result.map(bound_build_output).map_err(bound_build_output),
+            cleanup,
+        }
+    });
+    let reason = futures::select_biased! {
+        _ = cancellation.fuse() => "Build cancelled",
+        _ = event_stream.cancelled_by_user().fuse() => "Build cancelled",
+        _ = deadline.fuse() => "Build timed out (deadline includes authorization and terminal startup)",
+        outcome = (&mut job).fuse() => return outcome,
+    };
+    // Creation may already have launched a process before returning its handle.
+    // Signal cancellation, but retain the task so a late handle is killed and reaped.
+    drop(stop_sender);
+    let grace = cx.background_executor().timer(BUILD_KILL_GRACE);
+    let outcome = futures::select_biased! {
+        outcome = (&mut job).fuse() => Some(outcome),
+        _ = grace.fuse() => None,
+    };
+    match outcome {
+        Some(outcome) => {
+            let detail = match outcome.result {
+                Ok(output) | Err(output) => output,
+            };
+            QueuedTerminalResult {
+                result: Err(bound_build_output(format!("{reason}. {detail}"))),
+                cleanup: outcome.cleanup,
+            }
+        }
+        None => QueuedTerminalResult {
+            result: Err(format!(
+                "{reason}. Startup or process termination could not be confirmed within {} seconds. \
+                 The global build queue is temporarily unavailable to prevent overlapping builds. \
+                 Cleanup retains the startup task and will kill any subsequently returned terminal; \
+                 the queue will reopen only after startup fails or process exit is confirmed.",
+                BUILD_KILL_GRACE.as_secs(),
+            )),
+            cleanup: Some(cx.spawn(async move |_cx| {
+                let outcome = job.await;
+                if let Some(cleanup) = outcome.cleanup {
+                    cleanup.await;
+                }
+            })),
+        },
+    }
+}
+
+async fn finish_queued_terminal(
+    terminal: Rc<dyn crate::TerminalHandle>,
+    wait_for_exit: Option<futures::future::Shared<Task<acp_v2::TerminalExitStatus>>>,
+    cleanup: &mut Option<Task<()>>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let kill_error = terminal
+        .kill_queued_process_group(cx)
+        .err()
+        .map(|error| format!("{error:#}"));
+    // A failed tracking lookup can be transient. Retry it rather than retaining
+    // the slot forever based on one failed observation.
+    let death_confirmed = cx
+        .spawn(async move |cx| {
+            let mut wait_for_exit = wait_for_exit;
+            loop {
+                if wait_for_exit.is_none() {
+                    match terminal.wait_for_queue_completion(cx) {
+                        Ok(wait) => wait_for_exit = Some(wait),
+                        Err(error) => log::warn!("Retrying queued build exit tracking: {error:#}"),
+                    }
+                }
+                let exited = async {
+                    match &wait_for_exit {
+                        Some(wait) => {
+                            wait.clone().await;
+                        }
+                        None => futures::future::pending::<()>().await,
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(exited);
+                futures::select_biased! {
+                    _ = exited => break,
+                    _ = cx.background_executor().timer(Duration::from_secs(1)).fuse() => {},
+                }
+                if let Err(error) = terminal.kill_queued_process_group(cx) {
+                    log::warn!("Retrying queued build kill: {error:#}");
+                }
+            }
+        })
+        .shared();
+    let timer = cx.background_executor().timer(BUILD_KILL_GRACE);
+    let confirmed = futures::select_biased! {
+        _ = death_confirmed.clone().fuse() => true,
+        _ = timer.fuse() => false,
+    };
+    if !confirmed {
+        *cleanup = Some(cx.spawn(async move |_cx| {
+            death_confirmed.await;
+        }));
+        let detail = kill_error
+            .map(|error| format!(" Kill failed: {error}."))
+            .unwrap_or_default();
+        return Err(format!(
+            "Process exit could not be confirmed within {} seconds after requesting termination.{detail} \
+             The global build queue is temporarily unavailable to prevent overlapping builds; \
+             cleanup will keep retrying and reopen it once exit is confirmed. Stop the process manually if necessary.",
+            BUILD_KILL_GRACE.as_secs(),
+        ));
+    }
+    match kill_error {
+        Some(error) => Err(format!(
+            "Failed to kill build: {error}. Process exit was subsequently confirmed."
+        )),
+        None => Ok(()),
+    }
+}
+
+fn bound_build_output(mut output: String) -> String {
+    let limit = COMMAND_OUTPUT_LIMIT as usize;
+    if output.len() > limit {
+        let mut boundary = limit;
+        while !output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.truncate(boundary);
+        output.push_str("\n[Build output truncated]");
+    }
+    output
+}
+
 async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
@@ -421,7 +611,42 @@ async fn run_terminal_tool(
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
+    run_terminal_tool_inner(
+        project,
+        environment,
+        input,
+        event_stream,
+        None,
+        &mut None,
+        cx,
+    )
+    .await
+}
+
+async fn run_terminal_tool_inner(
+    project: Entity<Project>,
+    environment: Rc<dyn ThreadEnvironment>,
+    input: TerminalToolRequest,
+    event_stream: ToolCallEventStream,
+    cancellation: Option<futures::channel::oneshot::Receiver<()>>,
+    cleanup: &mut Option<Task<()>>,
+    cx: &mut AsyncApp,
+) -> Result<String, String> {
+    let queued = cancellation.is_some();
+    let cancellation = async move {
+        match cancellation {
+            Some(receiver) => match receiver.await {
+                Ok(()) | Err(_) => {}
+            },
+            None => futures::future::pending::<()>().await,
+        }
+    }
+    .boxed_local()
+    .shared();
     let selection = input.selection;
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let (working_dir, extra_env, sandbox_wrap, mut sandbox_not_applied) = {
+        let prepare = async {
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
@@ -669,9 +894,9 @@ async fn run_terminal_tool(
         {
             // Carry the underlying error so a prompt-delivery failure is
             // distinguishable from a genuine user abort.
-            return Ok(format!(
+            return Ok(std::ops::ControlFlow::Break(format!(
                 "Command cancelled: the user declined to run a command whose sandbox writes to a Windows drive ({error})."
-            ));
+            )));
         }
     }
 
@@ -692,13 +917,13 @@ async fn run_terminal_tool(
             cx.update(|cx| event_stream.authorize_sandbox(request.clone(), reason.to_string(), cx));
         if let Err(error) = approve.await {
             if want_unsandboxed {
-                return Ok(format!(
+                return Ok(std::ops::ControlFlow::Break(format!(
                     "Command cancelled: user denied permission to run outside the sandbox ({error})."
-                ));
+                )));
             }
-            return Ok(format!(
+            return Ok(std::ops::ControlFlow::Break(format!(
                 "Command cancelled: user denied the requested sandbox permissions ({error})."
-            ));
+            )));
         }
     }
 
@@ -802,11 +1027,11 @@ async fn run_terminal_tool(
                             break None;
                         }
                         Ok(SandboxFallbackDecision::Deny) | Err(_) => {
-                            return Ok(format!(
+                            return Ok(std::ops::ControlFlow::Break(format!(
                                 "Command cancelled: the sandbox could not be created ({}) and \
                                  the user declined to run it without one.",
                                 error.user_facing_message()
-                            ));
+                            )));
                         }
                     }
                 }
@@ -842,7 +1067,35 @@ async fn run_terminal_tool(
         None
     };
 
-    let output_byte_limit = if selection.is_enabled() {
+            Ok::<_, String>(std::ops::ControlFlow::Continue((
+                working_dir,
+                extra_env,
+                sandbox_wrap,
+                sandbox_not_applied,
+            )))
+        }
+        .fuse();
+        futures::pin_mut!(prepare);
+        let user_cancelled = async {
+            if queued {
+                event_stream.cancelled_by_user().await;
+            } else {
+                futures::future::pending::<()>().await;
+            }
+        }
+        .fuse();
+        futures::pin_mut!(user_cancelled);
+        futures::select_biased! {
+            _ = cancellation.clone().fuse() => return Err("Queued build cancelled.".into()),
+            _ = user_cancelled => return Err("Queued build cancelled.".into()),
+            result = prepare => match result? {
+                std::ops::ControlFlow::Continue(prepared) => prepared,
+                std::ops::ControlFlow::Break(output) => return Ok(output),
+            },
+        }
+    };
+
+    let output_byte_limit = if !queued && selection.is_enabled() {
         None
     } else {
         Some(COMMAND_OUTPUT_LIMIT)
@@ -893,17 +1146,24 @@ async fn run_terminal_tool(
             let sandbox_error = acp_thread::LinuxWslSandboxError::Other(message);
             log::warn!("Failed to create a WSL sandbox for an agent terminal command: {error:?}");
 
-            let decision = cx
-                .update(|cx| {
-                    event_stream.authorize_sandbox_fallback(
-                        Some(input.command.clone()),
-                        sandbox_error.user_facing_message(),
-                        Some(sandbox_error.docs_section().to_string()),
-                        retries,
-                        cx,
-                    )
-                })
-                .await;
+            let decision = cx.update(|cx| {
+                event_stream.authorize_sandbox_fallback(
+                    Some(input.command.clone()),
+                    sandbox_error.user_facing_message(),
+                    Some(sandbox_error.docs_section().to_string()),
+                    retries,
+                    cx,
+                )
+            });
+            let decision = if queued {
+                futures::select_biased! {
+                    _ = cancellation.clone().fuse() => return Err("Queued build cancelled.".into()),
+                    _ = event_stream.cancelled_by_user().fuse() => return Err("Queued build cancelled.".into()),
+                    decision = decision.fuse() => decision,
+                }
+            } else {
+                decision.await
+            };
             match decision {
                 Ok(SandboxFallbackDecision::Retry) => {
                     // WSL probe failures aren't cached, so retrying re-probes
@@ -981,7 +1241,35 @@ async fn run_terminal_tool(
         note
     });
 
-    let terminal_id = terminal.id(cx).map_err(|e| e.to_string())?;
+    let completion = if queued {
+        terminal.wait_for_queue_completion(cx)
+    } else {
+        terminal.wait_for_exit(cx)
+    };
+    let wait_for_exit = match completion {
+        Ok(wait_for_exit) => wait_for_exit,
+        Err(error) => {
+            if queued {
+                let message = format!("Cannot track queued build exit: {error:#}");
+                finish_queued_terminal(terminal.clone(), None, cleanup, cx)
+                    .await
+                    .map_err(|cleanup_error| format!("{message}. {cleanup_error}"))?;
+            }
+            return Err(error.to_string());
+        }
+    };
+    let terminal_id = match terminal.id(cx) {
+        Ok(terminal_id) => terminal_id,
+        Err(error) => {
+            if queued {
+                let message = format!("Cannot identify queued build terminal: {error:#}");
+                finish_queued_terminal(terminal.clone(), Some(wait_for_exit), cleanup, cx)
+                    .await
+                    .map_err(|cleanup_error| format!("{message}. {cleanup_error}"))?;
+            }
+            return Err(error.to_string());
+        }
+    };
     event_stream.update_fields(|update| {
         let update = update.content(vec![acp_v2::ToolCallContent::Terminal(
             acp_v2::Terminal::new(terminal_id),
@@ -992,41 +1280,53 @@ async fn run_terminal_tool(
         }
     });
 
-    let timeout = input.timeout_ms.map(Duration::from_millis);
+    let timeout = if queued {
+        None
+    } else {
+        input.timeout_ms.map(Duration::from_millis)
+    };
 
     let mut timed_out = false;
     let mut user_stopped_via_signal = false;
-    let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
-
-    match timeout {
-        Some(timeout) => {
-            let timeout_task = cx.background_executor().timer(timeout);
-
-            futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
-                _ = timeout_task.fuse() => {
-                    timed_out = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
-                }
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
-                }
-            }
+    let executor = cx.background_executor().clone();
+    let timeout_task = async move {
+        match timeout {
+            Some(timeout) => executor.timer(timeout).await,
+            None => futures::future::pending::<()>().await,
         }
-        None => {
-            futures::select! {
-                _ = wait_for_exit.clone().fuse() => {},
-                _ = event_stream.cancelled_by_user().fuse() => {
-                    user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
-                }
-            }
+    }
+    .fuse();
+    futures::pin_mut!(timeout_task);
+    let should_kill = futures::select! {
+        _ = wait_for_exit.clone().fuse() => false,
+        _ = timeout_task => {
+            timed_out = true;
+            true
+        }
+        _ = cancellation.clone().fuse() => {
+            user_stopped_via_signal = true;
+            true
+        }
+        _ = event_stream.cancelled_by_user().fuse() => {
+            user_stopped_via_signal = true;
+            true
         }
     };
+    if should_kill {
+        if queued {
+            let reason = if timed_out {
+                "Build timed out"
+            } else {
+                "Build cancelled"
+            };
+            finish_queued_terminal(terminal.clone(), Some(wait_for_exit), cleanup, cx)
+                .await
+                .map_err(|error| format!("{reason}. {error}"))?;
+        } else {
+            terminal.kill(cx).map_err(|error| error.to_string())?;
+            wait_for_exit.await;
+        }
+    }
 
     let user_stopped_via_signal = user_stopped_via_signal || event_stream.was_cancelled_by_user();
     let user_stopped_via_terminal = terminal.was_stopped_by_user(cx).unwrap_or(false);
@@ -1419,6 +1719,106 @@ fn resolve_cd_in_worktrees(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_output_is_bounded_on_unicode_boundaries() {
+        let output = super::bound_build_output("🦀".repeat(super::COMMAND_OUTPUT_LIMIT as usize));
+        assert!(output.len() <= super::COMMAND_OUTPUT_LIMIT as usize + 25);
+        assert!(output.ends_with("[Build output truncated]"));
+        assert_eq!(super::bound_build_output("short".into()), "short");
+    }
+
+    #[gpui::test]
+    async fn queued_terminal_timeout_kills_and_bounds_selected_output(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::channel::oneshot;
+
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = std::rc::Rc::new(cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            settings
+                .tool_permissions
+                .tools
+                .remove(super::TerminalTool::NAME);
+            agent_settings::AgentSettings::override_global(settings, cx);
+            crate::tests::FakeThreadEnvironment::default()
+                .with_terminal(crate::tests::FakeTerminalHandle::new_never_exits(cx))
+        }));
+        let (event_stream, _events) = crate::ToolCallEventStream::test();
+        let (cancellation_sender, cancellation_receiver) = oneshot::channel();
+        let task = cx.update(|cx| {
+            let environment = environment.clone();
+            cx.spawn(async move |cx| {
+                super::run_queued_terminal_tool(
+                    project,
+                    environment,
+                    super::SandboxedTerminalToolInput {
+                        command: "echo build".into(),
+                        cd: "root".into(),
+                        timeout_ms: Some(100),
+                        head_lines: Some(usize::MAX),
+                        ..Default::default()
+                    },
+                    event_stream,
+                    cancellation_receiver,
+                    cx.background_executor().now(),
+                    cx,
+                )
+                .await
+            })
+        });
+        let output = task
+            .await
+            .result
+            .expect_err("timed-out command should report its deadline");
+        assert!(output.contains("timed out"));
+        assert_eq!(
+            environment.terminal_output_limits(),
+            vec![Some(super::COMMAND_OUTPUT_LIMIT)]
+        );
+        drop(cancellation_sender);
+    }
+
+    #[gpui::test]
+    async fn queued_terminal_caller_cancellation_before_start_creates_no_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, ["/root".as_ref()], cx).await;
+        let environment = std::rc::Rc::new(crate::tests::FakeThreadEnvironment::default());
+        let (event_stream, _events) = crate::ToolCallEventStream::test();
+        let (cancellation_sender, cancellation_receiver) = futures::channel::oneshot::channel();
+        drop(cancellation_sender);
+        let task = cx.update(|cx| {
+            let environment = environment.clone();
+            cx.spawn(async move |cx| {
+                super::run_queued_terminal_tool(
+                    project,
+                    environment,
+                    super::SandboxedTerminalToolInput {
+                        command: "echo build".into(),
+                        cd: "root".into(),
+                        timeout_ms: Some(100),
+                        ..Default::default()
+                    },
+                    event_stream,
+                    cancellation_receiver,
+                    cx.background_executor().now(),
+                    cx,
+                )
+                .await
+            })
+        });
+        assert!(task.await.result.is_err());
+        assert_eq!(environment.terminal_creation_count(), 0);
+    }
+
     use super::*;
     use util::paths::PathStyle::{Unix, Windows};
 

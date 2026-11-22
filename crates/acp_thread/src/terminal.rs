@@ -633,6 +633,24 @@ impl Terminal {
         }
     }
 
+    pub fn wait_for_queue_completion(
+        &self,
+        cx: &mut App,
+    ) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
+        let exit = self.wait_for_exit()?;
+        let group = self.terminal.read(cx).wait_for_queue_completion()?;
+        Ok(cx
+            .spawn(async move |_| {
+                let (exit_status, ()) = futures::future::join(exit, group).await;
+                exit_status
+            })
+            .shared())
+    }
+
+    pub fn kill_queued_process_group(&self, cx: &App) -> Result<()> {
+        self.terminal.read(cx).kill_queued_process_group()
+    }
+
     pub fn kill(&mut self, cx: &mut App) {
         if !self.is_process_backed() {
             return;

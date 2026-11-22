@@ -619,6 +619,36 @@ fn codeblock_tag(full_path: &Path, line_range: Option<&RangeInclusive<u32>>) -> 
     result
 }
 
+fn visible_agent_message(message: &AgentMessage) -> String {
+    let mut text = String::new();
+    for content in &message.content {
+        match content {
+            AgentMessageContent::Text(content) => {
+                text.push_str(content);
+                text.push('\n');
+            }
+            AgentMessageContent::ToolUse(tool) => {
+                let status = if message.tool_results.contains_key(&tool.id) {
+                    "finished"
+                } else {
+                    "pending"
+                };
+                text.push_str(&format!("Tool: {} ({status})\n", tool.name));
+            }
+            AgentMessageContent::Thinking { .. } | AgentMessageContent::RedactedThinking(_) => {}
+        }
+    }
+    for result in message.tool_results.values() {
+        for content in &result.content {
+            if let LanguageModelToolResultContent::Text(content) = content {
+                text.push_str(content);
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
 impl AgentMessage {
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
@@ -775,8 +805,123 @@ pub trait TerminalHandle {
     fn id(&self, cx: &AsyncApp) -> Result<acp_v2::TerminalId>;
     fn current_output(&self, cx: &AsyncApp) -> Result<ProcessOutput>;
     fn wait_for_exit(&self, cx: &AsyncApp) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>>;
+    /// Native terminals must include owned descendants, not just the direct shell.
+    /// The default allows process-free test handles to retain their exit semantics.
+    fn wait_for_queue_completion(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
+        self.wait_for_exit(cx)
+    }
+    fn kill_queued_process_group(&self, cx: &AsyncApp) -> Result<()> {
+        self.kill(cx)
+    }
     fn kill(&self, cx: &AsyncApp) -> Result<()>;
     fn was_stopped_by_user(&self, cx: &AsyncApp) -> Result<bool>;
+}
+
+/// Cumulative counters use executor time, so polling never loses short tool calls.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubagentActivity {
+    pub active_tools: usize,
+    pub queued_build_waits: usize,
+    pub tool_execution: Duration,
+    pub queue_wait: Duration,
+}
+
+struct ThreadActivity {
+    snapshot: SubagentActivity,
+    updated_at: Instant,
+}
+
+impl ThreadActivity {
+    fn advance(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.updated_at);
+        if self.snapshot.queued_build_waits > 0 {
+            self.snapshot.queue_wait += elapsed;
+        } else if self.snapshot.active_tools > 0 {
+            self.snapshot.tool_execution += elapsed;
+        }
+        self.updated_at = now;
+    }
+}
+
+#[derive(Default)]
+pub struct ThreadActivityRegistry {
+    sessions: RefCell<HashMap<acp_v2::SessionId, std::rc::Weak<RefCell<ThreadActivity>>>>,
+}
+
+impl gpui::Global for ThreadActivityRegistry {}
+
+impl ThreadActivityRegistry {
+    fn register(session_id: acp_v2::SessionId, cx: &mut App) -> Rc<RefCell<ThreadActivity>> {
+        if !cx.has_global::<Self>() {
+            cx.set_global(Self::default());
+        }
+        let activity = Rc::new(RefCell::new(ThreadActivity {
+            snapshot: SubagentActivity::default(),
+            updated_at: cx.background_executor().now(),
+        }));
+        let mut sessions = cx.global::<Self>().sessions.borrow_mut();
+        sessions.retain(|_, activity| activity.strong_count() > 0);
+        sessions.insert(session_id, Rc::downgrade(&activity));
+        activity
+    }
+
+    /// Hold only while waiting for a build slot, not while executing the build.
+    /// Dropping the guard (including cancellation) resumes both timeout budgets.
+    pub fn queue_wait(session_id: &acp_v2::SessionId, cx: &App) -> Result<ThreadActivityGuard> {
+        let activity = cx
+            .try_global::<Self>()
+            .and_then(|registry| registry.sessions.borrow().get(session_id)?.upgrade())
+            .context("No activity registry entry for this thread")?;
+        Ok(ThreadActivityGuard::new(activity, true, cx))
+    }
+}
+
+pub struct ThreadActivityGuard {
+    activity: Rc<RefCell<ThreadActivity>>,
+    executor: gpui::BackgroundExecutor,
+    queued: bool,
+}
+
+impl ThreadActivityGuard {
+    fn new(activity: Rc<RefCell<ThreadActivity>>, queued: bool, cx: &App) -> Self {
+        Self::with_executor(activity, queued, cx.background_executor().clone())
+    }
+
+    fn with_executor(
+        activity: Rc<RefCell<ThreadActivity>>,
+        queued: bool,
+        executor: gpui::BackgroundExecutor,
+    ) -> Self {
+        {
+            let mut activity = activity.borrow_mut();
+            activity.advance(executor.now());
+            if queued {
+                activity.snapshot.queued_build_waits += 1;
+            } else {
+                activity.snapshot.active_tools += 1;
+            }
+        }
+        Self {
+            activity,
+            executor,
+            queued,
+        }
+    }
+}
+
+impl Drop for ThreadActivityGuard {
+    fn drop(&mut self) {
+        let mut activity = self.activity.borrow_mut();
+        activity.advance(self.executor.now());
+        if self.queued {
+            activity.snapshot.queued_build_waits -= 1;
+        } else {
+            activity.snapshot.active_tools -= 1;
+        }
+    }
 }
 
 pub trait SubagentHandle {
@@ -787,6 +932,30 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+
+    /// Called immediately before send, without yielding, to cover cancellation
+    /// before the send task has been polled for the first time.
+    fn prepare_send(&self, _cx: &mut App) -> Result<()> {
+        Ok(())
+    }
+
+    /// Opt in only when activity counters and cancellation cover prompt preparation
+    /// as well as model and tool execution, and send resolves after cancellation.
+    fn supports_timeouts(&self) -> bool {
+        false
+    }
+
+    fn activity(&self, _cx: &App) -> SubagentActivity {
+        SubagentActivity::default()
+    }
+
+    fn cancel(&self, _cx: &mut App) -> Task<()> {
+        Task::ready(())
+    }
+
+    fn inspect(&self, _cx: &App) -> Result<serde_json::Value> {
+        anyhow::bail!("Subagent inspection is not supported by this environment")
+    }
 }
 
 pub trait ThreadEnvironment {
@@ -1300,6 +1469,7 @@ pub(crate) struct StreamingSaveKey {
 
 pub struct Thread {
     id: acp_v2::SessionId,
+    activity: Rc<RefCell<ThreadActivity>>,
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
     title: Option<SharedString>,
@@ -1320,6 +1490,9 @@ pub struct Thread {
     /// running to completion. The UI sets this to deliver a "steering" queued
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
+    pending_subagent_request: bool,
+    yield_turn_for_subagent_request: bool,
+    subagents_survived_turn: bool,
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
@@ -1462,8 +1635,11 @@ impl Thread {
             None => Self::user_configured_model_selection(cx)
                 .map_or(ThreadModel::Unset, ThreadModel::Unresolved),
         };
+        let id = acp_v2::SessionId::new(uuid::Uuid::new_v4().to_string());
+        let activity = ThreadActivityRegistry::register(id.clone(), cx);
         Self {
-            id: acp_v2::SessionId::new(uuid::Uuid::new_v4().to_string()),
+            id,
+            activity,
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
             title: None,
@@ -1476,6 +1652,9 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            pending_subagent_request: false,
+            yield_turn_for_subagent_request: false,
+            subagents_survived_turn: false,
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
@@ -1804,6 +1983,7 @@ impl Thread {
         templates: Arc<Templates>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let activity = ThreadActivityRegistry::register(id.clone(), cx);
         let settings = AgentSettings::get_global(cx);
         let profile_id = db_thread
             .profile
@@ -1855,6 +2035,9 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            pending_subagent_request: false,
+            yield_turn_for_subagent_request: false,
+            subagents_survived_turn: false,
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
@@ -1886,6 +2069,7 @@ impl Thread {
             }),
             running_subagents: Vec::new(),
             inherits_parent_model_settings: true,
+            activity,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
@@ -2255,6 +2439,12 @@ impl Thread {
             self.project.clone(),
             cx.weak_entity(),
             self.action_log.clone(),
+            language_registry.clone(),
+        ));
+        self.add_tool(crate::WriteFilesTool::new(
+            self.project.clone(),
+            cx.weak_entity(),
+            self.action_log.clone(),
             language_registry,
         ));
         self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
@@ -2267,12 +2457,22 @@ impl Thread {
             self.action_log.clone(),
             update_agent_location,
         ));
+        self.add_tool(crate::ReadFilesTool::new(
+            self.project.clone(),
+            self.action_log.clone(),
+            update_agent_location,
+        ));
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(SandboxedTerminalTool::new(
             self.project.clone(),
             environment.clone(),
+        ));
+        self.add_tool(crate::BuildQueueTool::new(
+            self.project.clone(),
+            environment.clone(),
+            cx.weak_entity(),
         ));
         self.add_tool(WebSearchTool);
 
@@ -2295,6 +2495,9 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
+            self.add_tool(
+                crate::SubagentsTool::new(environment.clone()).with_parent(cx.entity(), cx),
+            );
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -2304,6 +2507,7 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
+        self.add_tool(crate::ConversationTool::new(cx.weak_entity()));
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -2381,6 +2585,7 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        cx.emit(SubagentsCancelled);
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent
@@ -2420,6 +2625,38 @@ impl Thread {
 
     pub fn end_turn_at_next_boundary(&self) -> bool {
         self.end_turn_at_next_boundary
+    }
+
+    pub fn has_running_subagents(&self, _cx: &App) -> bool {
+        self.running_subagents
+            .iter()
+            .any(|subagent| subagent.upgrade().is_some())
+    }
+
+    pub fn set_pending_subagent_request(&mut self, pending: bool, cx: &mut Context<Self>) {
+        self.pending_subagent_request = pending;
+        cx.notify();
+    }
+
+    pub(crate) fn request_yield_for_subagent_request(&mut self) {
+        self.yield_turn_for_subagent_request = true;
+    }
+
+    pub(crate) fn subagents_survived_turn(&self) -> bool {
+        self.subagents_survived_turn
+    }
+
+    fn record_subagents_at_turn_end(&mut self, cx: &App) {
+        self.subagents_survived_turn = self.has_running_subagents(cx);
+    }
+
+    pub fn pending_subagent_request(&self) -> bool {
+        self.pending_subagent_request
+    }
+
+    pub(crate) fn should_yield_for_subagent_request(&self, cx: &App) -> bool {
+        self.yield_turn_for_subagent_request
+            || (self.pending_subagent_request && self.has_running_subagents(cx))
     }
 
     fn accumulate_token_usage(&mut self, update: language_model::TokenUsage) {
@@ -2822,6 +3059,8 @@ impl Thread {
         // and fence detached cleanup while its command is prepared.
         self.flush_pending_message(cx);
         self.advance_prompt_id();
+        self.yield_turn_for_subagent_request = false;
+        self.subagents_survived_turn = false;
     }
 
     pub fn push_acp_user_block(
@@ -2873,7 +3112,10 @@ impl Thread {
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
-        self.cancel(cx).detach();
+        // Completed parent turns may leave persistent group jobs running.
+        if self.running_turn.is_some() {
+            self.cancel(cx).detach();
+        }
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
@@ -2911,6 +3153,11 @@ impl Thread {
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
+                        if let Err(error) =
+                            this.update(cx, |this, cx| this.record_subagents_at_turn_end(cx))
+                        {
+                            log::debug!("Failed to record subagents at turn end: {error:#}");
+                        }
                         event_stream.send_stop(acp_v2::StopReason::EndTurn);
                     }
                     Err(error) => {
@@ -3303,6 +3550,10 @@ impl Thread {
                 return Ok(());
             }
 
+            if this.update(cx, |this, cx| this.should_yield_for_subagent_request(cx))? {
+                return Ok(());
+            }
+
             if let Some(error) = error {
                 attempt += 1;
                 match Self::retry_completion_error(
@@ -3334,8 +3585,10 @@ impl Thread {
             } else {
                 let end_at_boundary =
                     this.update(cx, |this, _| this.end_turn_at_next_boundary())?;
-                if end_at_boundary {
-                    log::debug!("Steering message queued, ending turn at message boundary");
+                let yield_for_subagent_request =
+                    this.update(cx, |this, _| this.yield_turn_for_subagent_request)?;
+                if end_at_boundary || yield_for_subagent_request {
+                    log::debug!("Ending turn at message boundary for queued request");
                     return Ok(());
                 }
                 intent = CompletionIntent::ToolResults;
@@ -3943,9 +4196,22 @@ impl Thread {
         );
         tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
         let supports_images = self.model().is_some_and(|model| model.supports_images());
+        let activity = Rc::new(ToolInputActivity {
+            activity: self.activity.clone(),
+            guard: RefCell::new(None),
+            finished: std::cell::Cell::new(false),
+            executor: cx.background_executor().clone(),
+        });
+        let mut tool_input = tool_input;
+        tool_input.activity = Some(activity.clone());
+        let activity_guard = ToolExecutionActivityGuard(activity);
+        let synchronous_activity = ThreadActivityGuard::new(self.activity.clone(), false, cx);
         let tool_result = tool.run(tool_input, tool_event_stream, cx);
+        drop(synchronous_activity);
         cx.foreground_executor().spawn(async move {
-            let (is_error, output) = match tool_result.await {
+            let output = tool_result.await;
+            drop(activity_guard);
+            let (is_error, output) = match output {
                 Ok(mut output) => {
                     let contains_image = output
                         .llm_output
@@ -4543,6 +4809,106 @@ impl Thread {
             .iter()
             .filter_map(|s| s.upgrade().map(|s| s.read(cx).id().clone()))
             .collect()
+    }
+
+    /// Retained history includes pre-compaction messages, but never exposes reasoning.
+    pub fn conversation_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: Option<&str>,
+        newest_first: bool,
+    ) -> serde_json::Value {
+        let limit = limit.clamp(1, 20);
+        let query = query.map(str::to_lowercase);
+        let messages = &self.messages;
+        let mut entries = Vec::new();
+        let mut matched = 0usize;
+        let mut has_more = false;
+        let indices: Box<dyn Iterator<Item = usize>> = if newest_first {
+            Box::new((0..messages.len()).rev())
+        } else {
+            Box::new(0..messages.len())
+        };
+        for index in indices {
+            let Some(message) = messages.get(index) else {
+                continue;
+            };
+            let (role, text) = match message.as_ref() {
+                Message::User(message) => ("user", message.to_markdown()),
+                Message::Agent(message) => ("assistant", visible_agent_message(message)),
+                Message::Compaction(CompactionInfo::Summary(summary)) => {
+                    ("compaction", summary.to_string())
+                }
+                Message::Compaction(CompactionInfo::ProviderNative { .. }) | Message::Resume => {
+                    continue;
+                }
+            };
+            if query
+                .as_ref()
+                .is_some_and(|query| !text.to_lowercase().contains(query))
+            {
+                continue;
+            }
+            if matched < offset {
+                matched += 1;
+                continue;
+            }
+            if entries.len() == limit {
+                has_more = true;
+                break;
+            }
+            entries.push(serde_json::json!({
+                "message_index": index,
+                "role": role,
+                "text": text.chars().take(2000).collect::<String>(),
+                "truncated": text.chars().count() > 2000,
+            }));
+        }
+        serde_json::json!({
+            "entries": entries,
+            "next_offset": has_more.then_some(offset.saturating_add(limit)),
+            "retained_messages": self.messages.len(),
+            "history_revision": self.retained_history_revision,
+            "includes_pre_compaction": true,
+        })
+    }
+
+    pub fn ongoing_visible_output(&self) -> Option<String> {
+        self.pending_message
+            .as_ref()
+            .map(|message| visible_agent_message(message).chars().take(2000).collect())
+    }
+
+    pub fn ongoing_tools(&self) -> Vec<serde_json::Value> {
+        self.pending_message
+            .iter()
+            .chain(
+                self.messages
+                    .last()
+                    .and_then(|message| message.as_agent_message()),
+            )
+            .flat_map(|message| {
+                message.content.iter().filter_map(|content| {
+                    let AgentMessageContent::ToolUse(tool) = content else {
+                        return None;
+                    };
+                    (!message.tool_results.contains_key(&tool.id)).then(|| {
+                        serde_json::json!({
+                            "id": tool.id.to_string().chars().take(256).collect::<String>(),
+                            "name": tool.name.chars().take(128).collect::<String>(),
+                        })
+                    })
+                })
+            })
+            .take(20)
+            .collect()
+    }
+
+    pub fn subagent_activity(&self, cx: &App) -> SubagentActivity {
+        let mut activity = self.activity.borrow_mut();
+        activity.advance(cx.background_executor().now());
+        activity.snapshot.clone()
     }
 
     pub fn is_subagent(&self) -> bool {
@@ -5377,6 +5743,25 @@ pub struct ModelChanged;
 
 impl EventEmitter<ModelChanged> for Thread {}
 
+pub(crate) struct SubagentsCancelled;
+impl EventEmitter<SubagentsCancelled> for Thread {}
+
+struct ToolInputActivity {
+    activity: Rc<RefCell<ThreadActivity>>,
+    guard: RefCell<Option<ThreadActivityGuard>>,
+    finished: std::cell::Cell<bool>,
+    executor: gpui::BackgroundExecutor,
+}
+
+struct ToolExecutionActivityGuard(Rc<ToolInputActivity>);
+
+impl Drop for ToolExecutionActivityGuard {
+    fn drop(&mut self) {
+        self.0.finished.set(true);
+        self.0.guard.borrow_mut().take();
+    }
+}
+
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///
 /// For non-streaming tools, created via `ToolInput::ready()` so `.recv()` resolves immediately.
@@ -5384,6 +5769,7 @@ impl EventEmitter<ModelChanged> for Thread {}
 /// them, followed by the final complete input available through `.recv()`.
 pub struct ToolInput<T> {
     rx: mpsc::UnboundedReceiver<ToolInputPayload<serde_json::Value>>,
+    activity: Option<Rc<ToolInputActivity>>,
     _phantom: PhantomData<T>,
 }
 
@@ -5399,6 +5785,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
         tx.unbounded_send(ToolInputPayload::Full(value)).ok();
         Self {
             rx,
+            activity: None,
             _phantom: PhantomData,
         }
     }
@@ -5409,6 +5796,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
             .ok();
         Self {
             rx,
+            activity: None,
             _phantom: PhantomData,
         }
     }
@@ -5435,11 +5823,25 @@ impl<T: DeserializeOwned> ToolInput<T> {
     }
 
     pub async fn next(&mut self) -> Result<ToolInputPayload<T>> {
+        if let Some(activity) = &self.activity {
+            activity.guard.borrow_mut().take();
+        }
         let value = self
             .rx
             .next()
             .await
             .ok_or_else(|| anyhow!("tool input was not fully received"))?;
+        if let Some(activity) = &self.activity
+            && !activity.finished.get()
+        {
+            activity
+                .guard
+                .replace(Some(ThreadActivityGuard::with_executor(
+                    activity.activity.clone(),
+                    false,
+                    activity.executor.clone(),
+                )));
+        }
 
         Ok(match value {
             ToolInputPayload::Partial(payload) => ToolInputPayload::Partial(payload),
@@ -5452,9 +5854,10 @@ impl<T: DeserializeOwned> ToolInput<T> {
         })
     }
 
-    fn cast<U: DeserializeOwned>(self) -> ToolInput<U> {
+    pub(crate) fn cast<U: DeserializeOwned>(self) -> ToolInput<U> {
         ToolInput {
             rx: self.rx,
+            activity: self.activity,
             _phantom: PhantomData,
         }
     }
@@ -5480,6 +5883,7 @@ impl ToolInputSender {
         };
         let input = ToolInput {
             rx,
+            activity: None,
             _phantom: PhantomData,
         };
         (sender, input)
@@ -6044,6 +6448,13 @@ impl ToolCallEventStream {
             .is_some_and(|thread| thread.read(cx).is_subagent())
     }
 
+    pub(crate) fn pending_subagent_request(&self, cx: &App) -> bool {
+        self.thread
+            .as_ref()
+            .and_then(|thread| thread.upgrade())
+            .is_some_and(|thread| thread.read(cx).should_yield_for_subagent_request(cx))
+    }
+
     /// Persist the thread so a freshly recorded "for this thread" sandbox grant
     /// survives a reopen. Saving is driven by the agent's `observe` on the
     /// thread entity, so a no-op `notify` is enough to schedule it.
@@ -6076,6 +6487,13 @@ impl ToolCallEventStream {
     /// to determine if the completion was due to user cancellation.
     pub fn was_cancelled_by_user(&self) -> bool {
         *self.cancellation_rx.clone().borrow()
+    }
+
+    pub fn session_id(&self, cx: &App) -> Option<acp_v2::SessionId> {
+        self.thread
+            .as_ref()?
+            .read_with(cx, |thread, _| thread.id().clone())
+            .ok()
     }
 
     pub fn tool_use_id(&self) -> &LanguageModelToolUseId {
@@ -7297,6 +7715,78 @@ mod tests {
     use std::sync::Arc;
 
     #[gpui::test]
+    fn subagent_activity_tracks_overlapping_tools_and_queue_waits(cx: &mut TestAppContext) {
+        let session_id = acp_v2::SessionId::new("activity-test");
+        let activity = cx.update(|cx| ThreadActivityRegistry::register(session_id.clone(), cx));
+        let first = cx.update(|cx| ThreadActivityGuard::new(activity.clone(), false, cx));
+        let second = cx.update(|cx| ThreadActivityGuard::new(activity.clone(), false, cx));
+        cx.executor().advance_clock(Duration::from_millis(10));
+        let queued = cx.update(|cx| {
+            ThreadActivityRegistry::queue_wait(&session_id, cx).expect("registered session")
+        });
+        cx.executor().advance_clock(Duration::from_millis(50));
+        drop(first);
+        drop(queued);
+        cx.executor().advance_clock(Duration::from_millis(10));
+        drop(second);
+        let snapshot = &activity.borrow().snapshot;
+        assert_eq!(snapshot.active_tools, 0);
+        assert_eq!(snapshot.queued_build_waits, 0);
+        assert_eq!(snapshot.tool_execution, Duration::from_millis(20));
+        assert_eq!(snapshot.queue_wait, Duration::from_millis(50));
+    }
+
+    #[gpui::test]
+    async fn tool_activity_excludes_waiting_for_model_input(cx: &mut TestAppContext) {
+        let activity = cx.update(|cx| {
+            ThreadActivityRegistry::register(acp_v2::SessionId::new("input-test"), cx)
+        });
+        let timing = Rc::new(ToolInputActivity {
+            activity: activity.clone(),
+            guard: RefCell::new(None),
+            finished: std::cell::Cell::new(false),
+            executor: cx.background_executor.clone(),
+        });
+        let (mut sender, mut input) = ToolInputSender::channel();
+        input.activity = Some(timing.clone());
+        let task = cx.spawn(async move |_| input.recv().await);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        assert_eq!(activity.borrow().snapshot.active_tools, 0);
+        sender.send_full(json!({"ready": true}));
+        cx.run_until_parked();
+        assert_eq!(task.await.expect("full input"), json!({"ready": true}));
+        cx.executor().advance_clock(Duration::from_millis(10));
+        timing.guard.borrow_mut().take();
+        assert_eq!(
+            activity.borrow().snapshot.tool_execution,
+            Duration::from_millis(10)
+        );
+        drop(ToolExecutionActivityGuard(timing.clone()));
+        let mut later_input = ToolInput::<serde_json::Value>::ready(json!({}));
+        later_input.activity = Some(timing);
+        later_input.recv().await.expect("late input still arrives");
+        assert_eq!(activity.borrow().snapshot.active_tools, 0);
+    }
+
+    #[test]
+    fn visible_transcript_never_includes_reasoning() {
+        let message = AgentMessage {
+            content: vec![
+                AgentMessageContent::Text("visible answer".into()),
+                AgentMessageContent::Thinking {
+                    text: "private reasoning".into(),
+                    signature: None,
+                },
+                AgentMessageContent::RedactedThinking("private signature".into()),
+            ],
+            reasoning_details: Some(Arc::new(json!({"private": "provider reasoning"}))),
+            ..Default::default()
+        };
+        assert_eq!(visible_agent_message(&message), "visible answer\n");
+    }
+
+    #[gpui::test]
     async fn test_tool_call_events_preserve_opaque_id_storage(cx: &mut TestAppContext) {
         let storage: Arc<str> = Arc::from("  call/雪:\"quoted\"\\opaque  ");
         let tool_call_id = acp_v2::ToolCallId::new(storage.clone());
@@ -7612,6 +8102,49 @@ mod tests {
 
             (thread, event_stream, fake)
         })
+    }
+
+    #[gpui::test]
+    async fn conversation_pages_search_retained_pre_compaction_history(cx: &mut TestAppContext) {
+        let (thread, _events, _provider) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, _| {
+            thread.messages = vec![
+                Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::Text("OLD retained answer".into())],
+                    ..Default::default()
+                })),
+                Arc::new(Message::Compaction(CompactionInfo::Summary(
+                    "summary".into(),
+                ))),
+                Arc::new(Message::Agent(AgentMessage {
+                    content: vec![AgentMessageContent::Text("雪".repeat(2500))],
+                    ..Default::default()
+                })),
+            ];
+            let first = thread.conversation_page(0, 1, None, false);
+            assert_eq!(first["entries"][0]["message_index"], 0);
+            assert_eq!(first["next_offset"], 1);
+            let second = thread.conversation_page(1, 1, None, false);
+            assert_eq!(second["entries"][0]["role"], "compaction");
+            let search = thread.conversation_page(0, 20, Some("old RETAINED"), false);
+            assert_eq!(search["entries"].as_array().expect("entries").len(), 1);
+            assert_eq!(search["entries"][0]["message_index"], 0);
+            let newest = thread.conversation_page(0, 1, None, true);
+            assert_eq!(newest["entries"][0]["message_index"], 2);
+            assert_eq!(
+                newest["entries"][0]["text"]
+                    .as_str()
+                    .expect("text")
+                    .chars()
+                    .count(),
+                2000
+            );
+            assert_eq!(newest["entries"][0]["truncated"], true);
+            assert_eq!(
+                thread.conversation_page(100, 20, None, false)["entries"],
+                json!([])
+            );
+        });
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {

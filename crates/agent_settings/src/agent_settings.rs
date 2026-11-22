@@ -209,6 +209,9 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
+    pub build_queue_enabled: bool,
+    pub build_queue_default_timeout_ms: u64,
+    pub build_queue_max_timeout_ms: u64,
     pub enabled: bool,
     pub button: bool,
     pub dock: DockPosition,
@@ -261,6 +264,14 @@ pub struct ThreadsSidebarSettings {
 }
 
 impl AgentSettings {
+    pub fn build_queue_timeout_ms(&self, requested: Option<u64>) -> anyhow::Result<u64> {
+        validate_build_queue_timeout(
+            self.build_queue_default_timeout_ms,
+            self.build_queue_max_timeout_ms,
+            requested,
+        )
+    }
+
     pub fn enabled(&self, cx: &App) -> bool {
         self.enabled && !DisableAiSettings::get_global(cx).disable_ai
     }
@@ -772,6 +783,9 @@ impl Settings for AgentSettings {
         let agent = content.agent.clone().unwrap();
         let threads_sidebar = agent.threads_sidebar.unwrap();
         Self {
+            build_queue_enabled: agent.build_queue_enabled.unwrap_or(true),
+            build_queue_default_timeout_ms: agent.build_queue_default_timeout_ms.unwrap_or(600_000),
+            build_queue_max_timeout_ms: agent.build_queue_max_timeout_ms.unwrap_or(3_600_000),
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
@@ -849,6 +863,50 @@ impl Settings for AgentSettings {
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
         }
+    }
+}
+
+fn validate_build_queue_timeout(
+    default_timeout_ms: u64,
+    maximum_timeout_ms: u64,
+    requested: Option<u64>,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        maximum_timeout_ms > 0,
+        "agent.build_queue_max_timeout_ms must be positive"
+    );
+    anyhow::ensure!(
+        default_timeout_ms > 0 && default_timeout_ms <= maximum_timeout_ms,
+        "agent.build_queue_default_timeout_ms must be positive and no greater than agent.build_queue_max_timeout_ms"
+    );
+    let timeout_ms = requested.unwrap_or(default_timeout_ms);
+    anyhow::ensure!(
+        timeout_ms > 0 && timeout_ms <= maximum_timeout_ms,
+        "timeout_ms must be positive and no greater than the global build queue maximum ({maximum_timeout_ms} ms)"
+    );
+    Ok(timeout_ms)
+}
+
+#[cfg(test)]
+mod build_queue_tests {
+    use super::validate_build_queue_timeout;
+
+    #[test]
+    fn timeout_defaults_and_bounds() {
+        assert_eq!(
+            validate_build_queue_timeout(600_000, 3_600_000, None).ok(),
+            Some(600_000)
+        );
+        assert_eq!(
+            validate_build_queue_timeout(10, 20, Some(20)).ok(),
+            Some(20)
+        );
+        assert_eq!(validate_build_queue_timeout(10, 20, Some(1)).ok(), Some(1));
+        assert!(validate_build_queue_timeout(10, 20, Some(0)).is_err());
+        assert!(validate_build_queue_timeout(10, 20, Some(21)).is_err());
+        assert!(validate_build_queue_timeout(0, 20, None).is_err());
+        assert!(validate_build_queue_timeout(21, 20, Some(10)).is_err());
+        assert!(validate_build_queue_timeout(10, 0, None).is_err());
     }
 }
 
@@ -1115,6 +1173,36 @@ mod tests {
                 expected,
                 "{content}"
             );
+        }
+    }
+
+    #[gpui::test]
+    fn test_build_queue_works_without_user_configuration(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        for (content, expected_enabled) in [
+            (r#"{}"#, true),
+            (r#"{"agent": {}}"#, true),
+            (r#"{"agent": {"build_queue_enabled": false}}"#, false),
+            (r#"{"agent": {"build_queue_enabled": null}}"#, true),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(content, cx)
+                    .expect("user settings should load");
+            });
+            let settings = AgentSettings::get_global(cx);
+            assert_eq!(settings.build_queue_enabled, expected_enabled, "{content}");
+            assert_eq!(
+                settings
+                    .build_queue_timeout_ms(None)
+                    .expect("default timeout"),
+                600_000
+            );
+            assert_eq!(settings.build_queue_max_timeout_ms, 3_600_000);
         }
     }
 

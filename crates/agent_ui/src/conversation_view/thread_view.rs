@@ -1119,6 +1119,8 @@ impl ThreadView {
             editor
         });
 
+        subscriptions.push(cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify()));
+
         let show_codex_windows_warning = cfg!(windows)
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
@@ -2215,8 +2217,16 @@ impl ThreadView {
             {
                 return;
             }
-            if let Some(entry) = self.message_queue.try_fast_track(is_generating) {
-                self.dispatch_queued_entry(entry, window, cx);
+
+            let is_independent_subagent_request = self
+                .as_native_thread(cx)
+                .is_some_and(|thread| thread.read(cx).has_running_subagents(cx));
+            if let Some(entry) = self
+                .message_queue
+                .try_fast_track(is_generating, is_independent_subagent_request)
+            {
+                let cancel_current_generation = is_generating || !is_independent_subagent_request;
+                self.dispatch_queued_entry(entry, cancel_current_generation, window, cx);
             }
             return;
         }
@@ -2955,6 +2965,10 @@ impl ThreadView {
             content,
             tracked_buffers,
             steer: false,
+            independent_subagent_request: self.as_native_thread(cx).is_some_and(|thread| {
+                thread.read(cx).has_running_subagents(cx)
+                    && self.thread.read(cx).status() == ThreadStatus::Generating
+            }),
             editor,
             _subscription: subscription,
         });
@@ -3051,8 +3065,16 @@ impl ThreadView {
         cx.notify();
     }
 
-    pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
+    pub fn sync_queue_flag_to_native_thread(&mut self, cx: &mut Context<Self>) {
         if let Some(native_thread) = self.as_native_thread(cx) {
+            let has_running_subagents = native_thread.read(cx).has_running_subagents(cx);
+            if has_running_subagents
+                && let Some(front_id) = self.message_queue.first_id()
+                && let Some(front) = self.message_queue.entry_by_id_mut(front_id)
+            {
+                front.independent_subagent_request = true;
+            }
+
             // By default queued messages wait for the turn to fully complete.
             // Only a "steering" front message ends the turn at the next boundary.
             let end_at_boundary = self.message_queue.front_wants_steer()
@@ -3062,8 +3084,19 @@ impl ThreadView {
                         .validate_prompt_content(&entry.content)
                         .is_ok()
                 });
-            native_thread.update(cx, |thread, _| {
+            let valid_front = self.message_queue.first().is_some_and(|entry| {
+                self.thread
+                    .read(cx)
+                    .validate_prompt_content(&entry.content)
+                    .is_ok()
+            });
+            let pending_subagent_request = self
+                .message_queue
+                .front_wants_independent_subagent_request()
+                && valid_front;
+            native_thread.update(cx, |thread, cx| {
                 thread.set_end_turn_at_next_boundary(end_at_boundary);
+                thread.set_pending_subagent_request(pending_subagent_request, cx);
             });
         }
     }
@@ -3102,7 +3135,11 @@ impl ThreadView {
             .message_queue
             .on_generation_stopped(is_first_editor_focused)
         {
-            self.dispatch_queued_entry(entry, window, cx);
+            let is_independent_subagent_request = self
+                .as_native_thread(cx)
+                .is_some_and(|thread| thread.read(cx).has_running_subagents(cx));
+            let cancel_current_generation = !is_independent_subagent_request;
+            self.dispatch_queued_entry(entry, cancel_current_generation, window, cx);
             true
         } else {
             false
@@ -3119,8 +3156,12 @@ impl ThreadView {
             return;
         }
         let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
-        if let Some(entry) = self.message_queue.send_now(id, is_generating) {
-            self.dispatch_queued_entry(entry, window, cx);
+        let is_independent_subagent_request = self
+            .as_native_thread(cx)
+            .is_some_and(|thread| thread.read(cx).has_running_subagents(cx));
+        let cancel_current_generation = is_generating && !is_independent_subagent_request;
+        if let Some(entry) = self.message_queue.send_now(id, cancel_current_generation) {
+            self.dispatch_queued_entry(entry, cancel_current_generation, window, cx);
         }
     }
 
@@ -3130,10 +3171,19 @@ impl ThreadView {
     fn dispatch_queued_entry(
         &mut self,
         entry: QueueEntry,
+        cancel_current_generation: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let independent_subagent_request = self
+            .as_native_thread(cx)
+            .is_some_and(|thread| thread.read(cx).has_running_subagents(cx));
         self.sync_queue_flag_to_native_thread(cx);
+        if independent_subagent_request && let Some(native_thread) = self.as_native_thread(cx) {
+            native_thread.update(cx, |thread, cx| {
+                thread.set_pending_subagent_request(true, cx);
+            });
+        }
 
         cx.emit(AcpThreadViewEvent::Interacted);
 
@@ -3155,7 +3205,11 @@ impl ThreadView {
             })
             .is_some();
 
-        let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
+        let cancelled = if cancel_current_generation {
+            self.thread.update(cx, |thread, cx| thread.cancel(cx))
+        } else {
+            Task::ready(Ok(()))
+        };
 
         let workspace = self.workspace.clone();
 
@@ -4353,23 +4407,30 @@ impl ThreadView {
         awaiting_session_ids: &[acp_v2::SessionId],
         cx: &App,
     ) -> Vec<(SharedString, usize)> {
-        let tool_calls_by_session: HashMap<_, _> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(entry_ix, entry)| {
-                let AgentThreadEntry::ToolCall(tool_call) = entry else {
-                    return None;
-                };
-                let info = tool_call.subagent_session_info.as_ref()?;
-                let summary_text = tool_call.label.read(cx).source().to_string();
-                let subagent_summary = if summary_text.is_empty() {
-                    SharedString::from("Subagent")
-                } else {
-                    SharedString::from(summary_text)
-                };
-                Some((info.session_id.clone(), (subagent_summary, entry_ix)))
-            })
-            .collect();
+        let tool_calls_by_session: HashMap<_, _> =
+            entries
+                .iter()
+                .enumerate()
+                .flat_map(|(entry_ix, entry)| {
+                    let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                        return Vec::new();
+                    };
+                    let summary_text = tool_call.label.read(cx).source().to_string();
+                    let fallback_label = if summary_text.is_empty() {
+                        SharedString::from("Subagent")
+                    } else {
+                        SharedString::from(summary_text)
+                    };
+                    tool_call
+                        .subagent_session_info
+                        .iter()
+                        .map(|info| (info.session_id.clone(), (fallback_label.clone(), entry_ix)))
+                        .chain(tool_call.subagent_session_cards().into_iter().map(|card| {
+                            (card.session_info.session_id, (card.label.into(), entry_ix))
+                        }))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
 
         awaiting_session_ids
             .iter()
@@ -5695,6 +5756,32 @@ impl ThreadView {
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
                                     })
+                                    .when(self.as_native_connection(cx).is_some(), |this| {
+                                        this.child(
+                                            Button::new(
+                                                "subagent-model-selector",
+                                                crate::subagent_model_selector::button_label(cx),
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .end_icon(
+                                                Icon::new(IconName::ChevronDown)
+                                                    .color(Color::Muted)
+                                                    .size(IconSize::XSmall),
+                                            )
+                                            .tooltip(Tooltip::text(
+                                                "Choose a separate model for new subagents",
+                                            ))
+                                            .on_click(
+                                                |_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(crate::SelectSubagentModel),
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        )
+                                    })
                                     .child(self.render_send_button(cx)),
                             ),
                     ),
@@ -6712,6 +6799,9 @@ impl ThreadView {
         let focus_handle = message_editor.focus_handle(cx);
 
         let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        let has_running_subagents = self
+            .as_native_thread(cx)
+            .is_some_and(|thread| thread.read(cx).has_running_subagents(cx));
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
 
         if self.is_loading_contents {
@@ -6739,7 +6829,7 @@ impl ThreadView {
                 .on_click(cx.listener(|this, _event, _, cx| this.cancel_generation(cx)))
                 .into_any_element()
         } else {
-            let send_icon = if is_generating {
+            let send_icon = if is_generating && !has_running_subagents {
                 IconName::QueueMessage
             } else {
                 IconName::Send
@@ -6766,7 +6856,11 @@ impl ThreadView {
                                     h_flex()
                                         .gap_2()
                                         .justify_between()
-                                        .child(Label::new("Queue and Send"))
+                                        .child(Label::new(if has_running_subagents {
+                                            "Send to Parent (Subagents Continue)"
+                                        } else {
+                                            "Queue and Send"
+                                        }))
                                         .child(KeyBinding::for_action_in(&Chat, &focus_handle, cx)),
                                 )
                                 .child(
@@ -9679,7 +9773,7 @@ impl ThreadView {
             .id(container_id)
             .debug_selector(|| format!("tool-call-{}-{}", tool_call.id.0, layout.id_str()))
             .map(|this| {
-                if tool_call.is_subagent() {
+                if tool_call.is_subagent() && tool_call.subagent_session_cards().is_empty() {
                     this.child(
                         self.render_subagent_tool_call(
                             active_session_id,
@@ -9688,12 +9782,50 @@ impl ThreadView {
                             tool_call
                                 .subagent_session_info
                                 .as_ref()
-                                .map(|i| i.session_id.clone()),
+                                .map(|info| info.session_id.clone()),
                             focus_handle,
                             window,
                             cx,
                         ),
                     )
+                    .children(self.render_generic_tool_permissions(
+                        active_session_id,
+                        tool_call,
+                        cx,
+                    ))
+                } else if !tool_call.subagent_session_cards().is_empty() {
+                    this.children(tool_call.subagent_session_cards().into_iter().map(|card| {
+                        let session_id = card.session_info.session_id.clone();
+                        let subagent_thread_view = self
+                            .server_view
+                            .upgrade()
+                            .and_then(|server_view| server_view.read(cx).as_connected())
+                            .and_then(|connected| connected.threads.get(&session_id));
+                        let state = SubagentCardState::from_coordinated_tool_call(
+                            &card,
+                            subagent_thread_view.map(|view| view.read(cx).thread.read(cx)),
+                        );
+                        div()
+                            .id(ElementId::Name(SharedString::from(format!(
+                                "coordinated-subagent-{}-{}",
+                                tool_call.id.0, session_id.0
+                            ))))
+                            .child(self.render_subagent_tool_call_with_state(
+                                active_session_id,
+                                entry_ix,
+                                tool_call,
+                                Some(session_id.clone()),
+                                state,
+                                SubagentCardId::CoordinatedToolCall(
+                                    tool_call.id.clone(),
+                                    session_id,
+                                ),
+                                focus_handle,
+                                window,
+                                cx,
+                            ))
+                            .into_any_element()
+                    }))
                     .children(self.render_generic_tool_permissions(
                         active_session_id,
                         tool_call,
@@ -12261,7 +12393,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let subagent_thread_view = subagent_session_id.and_then(|session_id| {
+        let subagent_thread_view = subagent_session_id.as_ref().and_then(|session_id| {
             self.server_view
                 .upgrade()
                 .and_then(|server_view| server_view.read(cx).as_connected())
@@ -12273,10 +12405,41 @@ impl ThreadView {
             subagent_thread_view.map(|view| view.read(cx).thread.read(cx)),
             cx,
         );
+        self.render_subagent_tool_call_with_state(
+            active_session_id,
+            entry_ix,
+            tool_call,
+            subagent_session_id,
+            state,
+            SubagentCardId::ToolCall(tool_call.id.clone()),
+            focus_handle,
+            window,
+            cx,
+        )
+    }
+
+    fn render_subagent_tool_call_with_state(
+        &self,
+        active_session_id: &acp_v2::SessionId,
+        entry_ix: usize,
+        _tool_call: &ToolCall,
+        subagent_session_id: Option<acp_v2::SessionId>,
+        state: SubagentCardState,
+        card_id: SubagentCardId,
+        focus_handle: &FocusHandle,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let subagent_thread_view = subagent_session_id.as_ref().and_then(|session_id| {
+            self.server_view
+                .upgrade()
+                .and_then(|server_view| server_view.read(cx).as_connected())
+                .and_then(|connected| connected.threads.get(session_id))
+        });
         let content = self.render_subagent_card(
             active_session_id,
             entry_ix,
-            &SubagentCardId::ToolCall(tool_call.id.clone()),
+            &card_id,
             &state,
             subagent_thread_view,
             focus_handle,
@@ -12639,6 +12802,9 @@ impl ThreadView {
         let state = self.entry_view_state.read(cx);
         match card_id {
             SubagentCardId::ToolCall(id) => state.is_tool_call_expanded(id),
+            SubagentCardId::CoordinatedToolCall(id, session_id) => state.is_tool_call_expanded(
+                &acp_v2::ToolCallId::new(format!("{}:{}", id.0, session_id.0)),
+            ),
             SubagentCardId::SessionMessage(id) => state.is_session_message_card_expanded(id),
         }
     }
@@ -12651,6 +12817,11 @@ impl ThreadView {
     ) -> bool {
         self.entry_view_state.update(cx, |state, _| match card_id {
             SubagentCardId::ToolCall(id) => state.toggle_tool_call_expansion(id),
+            SubagentCardId::CoordinatedToolCall(id, session_id) => state
+                .toggle_tool_call_expansion(&acp_v2::ToolCallId::new(format!(
+                    "{}:{}",
+                    id.0, session_id.0
+                ))),
             SubagentCardId::SessionMessage(id) => state.toggle_session_message_card_expansion(id),
         });
         self.is_subagent_card_expanded(card_id, cx)

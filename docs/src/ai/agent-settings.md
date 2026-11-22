@@ -55,6 +55,27 @@ Use `agent.commit_message_instructions` for instructions that apply only to gene
 
 For feature-specific model examples, see [Feature-specific Models](#feature-specific-models).
 
+## Build Queue {#build-queue}
+
+The `build_queue` tool is available without configuration and serializes heavy build commands across native-agent threads in all participating Zed processes for the same operating-system user. Agents can choose it for heavy commands while continuing to use `terminal` for lightweight work.
+
+The default job timeout is 10 minutes and the maximum is one hour. You do not need to add settings to use these defaults. To change the limits or disable the queue, open your global settings file with {#action zed::OpenSettingsFile}; these settings are not exposed as dedicated Settings Editor controls. Project settings cannot change the queue's availability or timeout limits.
+
+For example, this optional configuration changes the default timeout to five minutes and the maximum to 30 minutes:
+
+```json [settings]
+{
+  "agent": {
+    "build_queue_default_timeout_ms": 300000,
+    "build_queue_max_timeout_ms": 1800000
+  }
+}
+```
+
+Both timeout values must be positive, and the default must not exceed the maximum. Explicit job timeouts above the maximum are rejected rather than silently extended or clamped. Set `agent.build_queue_enabled` to `false` only if you want to disable the tool.
+
+Waiting for a queue slot consumes neither the job's execution timeout nor either subagent timeout mode. Once a job gets the slot, its timeout covers permission prompts, process startup, and command execution. Operating-system leases coordinate separate Zed processes. Dead queued callers are recovered automatically; an unconfirmed active build blocks admission until cleanup confirms exit or you verify that the build has stopped and remove its identified ticket. See [Tools](./tools.md#build_queue) for cancellation and failure behavior.
+
 ## Automatic Compaction {#automatic-compaction}
 
 Zed Agent can automatically compact long threads before they reach the selected model's context window. Compaction summarizes earlier messages and keeps the conversation usable without starting a new thread.
@@ -158,9 +179,13 @@ See [LLM Providers](./llm-providers.md) for model access, and [All Settings](../
 
 ### Subagent Models {#subagent-models}
 
-By default, Zed Agent's subagents inherit the parent thread's model, thinking setting, reasoning effort, and speed. Set `agent.subagent_model` in `settings.json` to choose separate model, reasoning, and speed settings. You can override the model by asking the agent to use a specific model for a subagent. When that model matches the provider and model in `agent.subagent_model`, its `enable_thinking`, `effort`, and `speed` settings are preserved. This setting does not configure [External Agents](./external-agents.md).
+While chatting with the native **Zed** agent, click **Subagents: Parent Model** beside the main model selector at the bottom of the chat composer. The control shows the selected subagent model after you choose one. Search the provider/model list and select a model; Zed saves your choice automatically without changing the parent thread's model. Select **Use Parent Model** to clear the override. The same picker is also available from **Agent Panel → … → Subagent Model…**.
 
-Configure this setting with a `provider` and `model`. To choose a reasoning effort for a model that supports it, also set `enable_thinking` and `effort`:
+The choice applies to newly created subagents; existing subagent sessions keep their model. By default, subagents inherit the parent thread's model, thinking setting, reasoning effort, and speed. Selecting a different model uses its supported defaults. Reselecting the same configured provider/model preserves its thinking, effort, and speed settings. This picker does not configure [External Agents](./external-agents.md).
+
+For optional reasoning and speed customization, set `agent.subagent_model` in `settings.json`. You can also ask the parent agent to use a specific model for an individual subagent. When that model matches the configured provider and model, its `enable_thinking`, `effort`, and `speed` settings are preserved.
+
+For example, to choose a reasoning effort for a model that supports it, set `enable_thinking` and `effort`:
 
 ```json [settings]
 {

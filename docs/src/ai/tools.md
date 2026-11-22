@@ -53,6 +53,23 @@ Lists files and directories in a given path, providing an overview of filesystem
 
 Reads the content of a specified file in the project, allowing access to file contents.
 
+### `read_files`
+
+Reads 1–20 files in one call. Each entry accepts the same `path`, `start_line`, and `end_line` fields as `read_file`. Results stay in request order, including image content and individual errors. One failed read does not discard successful reads.
+
+```json
+{
+  "files": [
+    { "path": "my-project/src/parser.rs", "start_line": 1, "end_line": 80 },
+    { "path": "my-project/src/config.rs" }
+  ]
+}
+```
+
+### `conversation`
+
+Browses the current thread's retained messages, including messages omitted from model context by compaction. Use `query` for case-insensitive text search, `offset` and `limit` for pagination, and `newest_first` to reverse the order. Pages contain at most 20 messages, with each message limited to 2,000 characters. Hidden reasoning is excluded. Browsing old code does not count as reading its current file contents.
+
 ## Web Tools
 
 ### `search_web`
@@ -91,11 +108,29 @@ Moves or renames a file or directory in the project, performing a rename if only
 
 Creates a new file or overwrites an existing file with completely new contents.
 
+### `write_files`
+
+Creates or overwrites 1–20 files in one call, using a `files` array of `path` and `content` objects. Files are processed in order, with the same permissions and review flow as `write_file`. Results report each success or error separately. This is not an atomic transaction: successful writes remain if another file fails.
+
+Overwriting an existing file with either write tool requires a successful read in the same agent thread. Forwarded startup snapshots and conversation-history results do not satisfy this requirement. Read again if the file changes or after overwriting it. Creating a new file does not require a prior read.
+
 ### `terminal`
 
 Executes shell commands and returns the combined output, creating a new shell process for each invocation.
 
 **Example:** After editing a Rust file, run `cargo test --package my_crate 2>&1 | tail -30` to confirm the changes don't break existing tests. Or run `git diff --stat` to review which files have been modified before wrapping up a task.
+
+### `build_queue`
+
+Submits one command to a FIFO queue shared by native-agent threads across all participating Zed processes for the same operating-system user. Separate windows, projects, release channels, and custom user-data folders share admission. Only one queued command can run at a time. Agents choose this tool instead of `terminal` to serialize heavy work; ordinary terminal commands and external-agent commands are not serialized.
+
+The queue is available without adding any settings. See [Build Queue](./agent-settings.md#build-queue) for its built-in timeout defaults and optional customization. The command accepts the terminal tool's command, working folder, output-limit, and sandbox-permission fields. It uses the same terminal permission rules and sandbox policy.
+
+Every submission has a positive timeout. The timeout starts after both local and cross-process admission and covers authorization, startup, and execution—not time waiting for a slot. Cancellation or expiry retains the queue lease until the command's process group is confirmed empty. If termination cannot be confirmed, participating processes reject queued jobs rather than start overlapping builds. The queue recovers when exit is confirmed.
+
+Queued execution currently supports local Linux terminals. Commands must stay in their original process group: do not daemonize, use `setsid`, or enable separate job-control groups. Ordinary terminal calls keep their existing behavior.
+
+Admission uses operating-system file locks and private ticket files in `/tmp/zed-build-queue-<effective-uid>`. Processes must share that filesystem namespace; separate containers with private `/tmp` mounts do not coordinate. Tickets from dead queued callers are recovered automatically. If a Zed process dies after admission, its build might survive, so its active ticket fails closed. The error identifies that ticket: verify that no build remains before removing it. Never delete the queue's coordinator file or folder while Zed processes are using it.
 
 ## Other Tools
 
@@ -111,4 +146,35 @@ Spawns a subagent with its own context window to perform a delegated task. Usefu
 
 To configure a subagent's model, reasoning effort, and speed, see [Subagent Models](./agent-settings.md#subagent-models).
 
-**Example:** While refactoring the authentication module, spawn a subagent to investigate how session tokens are validated elsewhere in the codebase. The parent agent continues its work and reviews the subagent's findings when it completes — keeping both context windows focused on a single task.
+`timeout_ms` optionally bounds a subagent turn. Set `timeout_mode` to `"total"` to count the whole turn, or `"tool_calls"` to count only time spent executing tools, excluding model generation and streamed-input waits. Both modes pause while that subagent waits for the build queue. On expiry, Zed cancels the turn and returns its session ID for follow-up. Omitting the timeout preserves unlimited execution.
+
+Use `startup_context` to forward code already known to the parent as an array of `{ "path": "...", "content": "..." }` snapshots. Zed labels these as untrusted, possibly stale context. They are limited to 32 snapshots and 128 KiB in total and do not count as fresh file reads. A subagent must read existing files itself before overwriting them.
+
+### `subagents`
+
+Coordinates multiple subagents and inspects their current work. It supports these operations:
+
+- `spawn_groups`: starts several groups concurrently and waits until a whole group finishes. Its response contains that group's outputs and the current status of every remaining group and agent.
+- `wait_groups`: waits for the next unreported whole-group completion. Pass `group_ids` to select groups, or omit it to consider every retained group.
+- `spawn`: starts one group and waits for its first agent result, for up to 30 seconds.
+- `wait`: waits for any new agent result or all results in a specific group, using `mode: "any"` or `"all"`.
+- `inspect`: reads a directly owned subagent's visible output, active tool information, and activity counters using its `session_id`. It does not expose hidden reasoning or unrelated threads.
+- `list`: lists retained groups and job statuses.
+
+For example, this starts two groups and returns when the first group finishes, while the other keeps working:
+
+```json
+{
+  "operation": "spawn_groups",
+  "groups": [
+    [{ "label": "Review parser", "message": "Review my-project/src/parser.rs for error-handling bugs. Do not edit.", "timeout_ms": 120000 }],
+    [{ "label": "Review tests", "message": "Review my-project/tests for missing parser edge cases. Do not edit.", "timeout_ms": 180000 }]
+  ]
+}
+```
+
+The calling model resumes through the pending tool result. It can work on a completed group's findings, then call `wait_groups` again for the next boundary. No unsolicited model turn starts after the user turn ends. Optional `wait_timeout_ms` limits a wait without cancelling the jobs; `0` polls immediately. Individual jobs can use the same model, timeout, and startup-context options as `spawn_agent`.
+
+Groups contain 1–16 agents, with up to 128 retained jobs per parent session. Jobs survive tool calls and ordinary parent turns, but not application restarts. Cancelling the parent stops its running jobs. Returned outputs are bounded and indicate truncation.
+
+See [Agent Profiles](./agent-profiles.md) to control which tools your agents can use.

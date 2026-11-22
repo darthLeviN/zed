@@ -1306,6 +1306,11 @@
     },
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
+    // Build queue shared by native agents across Zed processes for the same user.
+    // Queued jobs run one at a time; waiting does not consume runtime limits.
+    "build_queue_enabled": true,
+    "build_queue_default_timeout_ms": 600000,
+    "build_queue_max_timeout_ms": 3600000,
     "default_profile": "write",
     "profiles": {
       "write": {
@@ -1330,6 +1335,11 @@
           "list_directory": true,
           "move_path": true,
           "read_file": true,
+          "read_files": true,
+          "write_files": true,
+          "build_queue": true,
+          "conversation": true,
+          "subagents": true,
           "rename_symbol": true,
           "search_web": true,
           "skill": true,
@@ -1355,6 +1365,9 @@
           "list_agents_and_models": true,
           "list_directory": true,
           "read_file": true,
+          "read_files": true,
+          "conversation": true,
+          "subagents": true,
           "search_web": true,
           "skill": true,
           "spawn_agent": true,

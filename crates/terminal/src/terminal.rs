@@ -1029,6 +1029,7 @@ impl TerminalBuilder {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
+            queue_process_group: Err("Display-only terminal has no owned process group".into()),
             completion_tx: None,
             term,
             term_config: config,
@@ -1235,7 +1236,7 @@ impl TerminalBuilder {
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
             // PTY path would feed.
-            let (terminal_type, subprocess) = if no_pty {
+            let (terminal_type, subprocess, queue_process_group) = if no_pty {
                 let (program, args) = match &shell_params {
                     Some(params) => (
                         params.program.clone(),
@@ -1263,7 +1264,12 @@ impl TerminalBuilder {
                         });
                     }
                 };
-                (TerminalType::DisplayOnly, Some(subprocess))
+                let queue_process_group = subprocess.queue_process_group.clone();
+                (
+                    TerminalType::DisplayOnly,
+                    Some(subprocess),
+                    queue_process_group,
+                )
             } else {
                 let alacritty_shell = shell_params.as_ref().map(|params| {
                     (
@@ -1299,7 +1305,10 @@ impl TerminalBuilder {
                     }
                 };
 
-                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
+                let process_id = ProcessIdGetter::from(&pty);
+                let queue_process_group =
+                    QueueProcessGroup::capture(process_id.fallback_pid().as_u32());
+                let pty_info = PtyProcessInfo::new(process_id);
 
                 //And connect them together
                 let pty_tx =
@@ -1311,6 +1320,7 @@ impl TerminalBuilder {
                         info: Arc::new(pty_info),
                     },
                     None,
+                    queue_process_group,
                 )
             };
 
@@ -1319,6 +1329,7 @@ impl TerminalBuilder {
                 task,
                 terminal_type,
                 subprocess,
+                queue_process_group,
                 completion_tx,
                 term,
                 term_config: config,
@@ -1524,6 +1535,7 @@ pub struct Terminal {
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
+    queue_process_group: Result<Arc<parking_lot::Mutex<QueueProcessGroup>>, String>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
@@ -3107,6 +3119,38 @@ impl Terminal {
         }
     }
 
+    /// Queue ownership is captured before the event loop can reap the shell or release the PTY.
+    /// Only descendants remaining in the original process group are supported: daemonization,
+    /// setsid, and separate job-control process groups are not queue-safe.
+    pub fn wait_for_queue_completion(&self) -> Result<Task<()>> {
+        let group = self
+            .queue_process_group
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .clone();
+        let executor = self.background_executor.clone();
+        Ok(self.background_executor.spawn(async move {
+            loop {
+                match group.lock().refresh() {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        log::warn!("Cannot confirm queued process group completion: {error:#}")
+                    }
+                }
+                executor.timer(Duration::from_millis(20)).await;
+            }
+        }))
+    }
+
+    pub fn kill_queued_process_group(&self) -> Result<()> {
+        self.queue_process_group
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .lock()
+            .kill()
+    }
+
     pub fn kill_active_task(&mut self) {
         if let Some(task) = self.task()
             && task.status == TaskStatus::Running
@@ -3358,10 +3402,165 @@ fn convert_lf_to_crlf(bytes: &[u8], previous_byte_was_cr: &mut bool) -> Vec<u8> 
     converted
 }
 
+#[cfg(target_os = "linux")]
+struct QueueProcessGroup {
+    process_group: libc::pid_t,
+    members: Vec<std::os::fd::OwnedFd>,
+    empty: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct QueueProcessGroup;
+
+impl QueueProcessGroup {
+    #[cfg(not(target_os = "linux"))]
+    fn capture(_process_id: u32) -> Result<Arc<parking_lot::Mutex<Self>>, String> {
+        Err("Queue process-group completion is currently supported only on Linux".into())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn refresh(&mut self) -> Result<bool> {
+        bail!("Queue process-group completion is unsupported on this platform")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn kill(&mut self) -> Result<()> {
+        bail!("Queue process-group cleanup is unsupported on this platform")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture(process_id: u32) -> Result<Arc<parking_lot::Mutex<Self>>, String> {
+        let process_group = i32::try_from(process_id).map_err(|error| error.to_string())?;
+        if process_group <= 1 {
+            return Err("Invalid queue process group".into());
+        }
+        let mut group = Self {
+            process_group,
+            members: Vec::new(),
+            empty: false,
+        };
+        if let Ok(member) = Self::open_pid(process_group) {
+            // The caller still owns the unreaped child at this point.
+            if unsafe { libc::getpgid(process_group) } == process_group {
+                group.members.push(member);
+            }
+        }
+        Ok(Arc::new(parking_lot::Mutex::new(group)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_pid(process_id: libc::pid_t) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn alive(member: &std::os::fd::OwnedFd) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: member.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(descriptor.revents == 0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh(&mut self) -> Result<bool> {
+        if self.empty {
+            return Ok(true);
+        }
+        // ESRCH is an atomic observation of an empty group, unlike a /proc scan
+        // during which a process can fork. Latch it and never signal that ID again.
+        if unsafe { libc::kill(-self.process_group, 0) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                self.empty = true;
+                self.members.clear();
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
+
+        let anchor = self
+            .members
+            .iter()
+            .find_map(|member| match Self::alive(member) {
+                Ok(true) => Some(Ok(member)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .transpose()?;
+        let Some(anchor) = anchor else {
+            // Without a live, previously owned member, numeric group IDs may have
+            // been reused. Do not adopt or signal processes; only wait for ESRCH.
+            return Ok(false);
+        };
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(process_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(member) = Self::open_pid(process_id) else {
+                continue;
+            };
+            if unsafe { libc::getpgid(process_id) } == self.process_group && Self::alive(&member)? {
+                members.push(member);
+            }
+        }
+        // A live anchor across the entire snapshot prevents group-ID reuse. Each
+        // new pidfd was opened before membership was checked and remained alive,
+        // preventing PID reuse between that check and signalling as well.
+        if Self::alive(anchor)? {
+            self.members = members;
+        }
+        Ok(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kill(&mut self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        if self.refresh()? {
+            return Ok(());
+        }
+        for member in &self.members {
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    member.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Owns a non-PTY task subprocess and the background task pumping its output
 /// into the terminal emulator. Used by headless hosts (e.g. the eval CLI) where
 /// PTY allocation fails with `ENOTTY`. Dropping this kills the child.
 struct SubprocessHandle {
+    queue_process_group: Result<Arc<parking_lot::Mutex<QueueProcessGroup>>, String>,
     child: Arc<parking_lot::Mutex<Option<util::process::Child>>>,
     _reader: Task<()>,
 }
@@ -3398,6 +3597,15 @@ fn spawn_task_subprocess(
 
     let mut child =
         util::process::Child::spawn(command, Stdio::null(), Stdio::piped(), Stdio::piped())?;
+    let queue_process_group = QueueProcessGroup::capture(child.id());
+    #[cfg(target_os = "linux")]
+    if !matches!(child.try_status(), Ok(None)) {
+        // smol may reap immediately. A pidfd opened after that could refer to a
+        // reused PID, so retain only the non-signalling emptiness observation.
+        if let Ok(group) = &queue_process_group {
+            group.lock().members.clear();
+        }
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let child = Arc::new(parking_lot::Mutex::new(Some(child)));
@@ -3474,6 +3682,7 @@ fn spawn_task_subprocess(
     });
 
     Ok(SubprocessHandle {
+        queue_process_group,
         child,
         _reader: reader,
     })
@@ -3676,6 +3885,89 @@ mod tests {
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
     use task::{Shell, ShellBuilder};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_process_group_outlives_shell_and_drains_after_kill() -> Result<()> {
+        use std::io::{BufRead as _, BufReader};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        const ISOLATED: &str = "ZED_QUEUE_GROUP_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::queued_process_group_outlives_shell_and_drains_after_kill",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated process-group regression failed");
+            return Ok(());
+        }
+
+        // Reap the orphan ourselves, independently of the host's PID 1. Isolate
+        // this setting so it cannot steal children from other parallel tests.
+        anyhow::ensure!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0);
+        let mut shell = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; read release",
+            ])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let group = QueueProcessGroup::capture(shell.id()).map_err(anyhow::Error::msg)?;
+        let mut background_pid = String::new();
+        BufReader::new(shell.stdout.take().context("missing shell stdout")?)
+            .read_line(&mut background_pid)?;
+        let background_pid = background_pid.trim().parse::<i32>()?;
+        assert!(!group.lock().refresh()?);
+        drop(shell.stdin.take());
+        shell.wait()?;
+        assert!(
+            !group.lock().refresh()?,
+            "shell exit must not release the queue slot"
+        );
+
+        group.lock().kill()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(background_pid, &mut status, libc::WNOHANG) };
+            if result == background_pid {
+                break;
+            }
+            anyhow::ensure!(
+                result == 0,
+                "failed to reap background child: {}",
+                std::io::Error::last_os_error()
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "background child survived queue cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        assert!(
+            group.lock().refresh()?,
+            "group must be empty before another build starts"
+        );
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .status()?
+                .success()
+        );
+        // A completed owner remains complete and cannot signal a reused group ID.
+        group.lock().kill()?;
+        assert!(group.lock().refresh()?);
+        Ok(())
+    }
 
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {

@@ -968,7 +968,8 @@ impl NativeAgent {
             cx.subscribe(
                 &thread_handle,
                 |this, thread, _: &crate::thread::CancellationRequested, cx| {
-                    this.cancel_session(thread.read(cx).id());
+                    let session_id = thread.read(cx).id().clone();
+                    this.cancel_session(&session_id, cx);
                 },
             ),
             cx.observe(&thread_handle, move |this, thread, cx| {
@@ -1038,10 +1039,21 @@ impl NativeAgent {
         acp_thread
     }
 
-    fn cancel_session(&mut self, session_id: &acp_v2::SessionId) {
+    fn cancel_session(&mut self, session_id: &acp_v2::SessionId, cx: &mut App) {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
+        if session
+            .execution
+            .as_ref()
+            .is_none_or(|execution| execution.completion.clone().now_or_never().is_some())
+        {
+            // Completed executions remain stored while persistent subagents run.
+            session
+                .thread
+                .update(cx, |thread, cx| thread.cancel(cx))
+                .detach();
+        }
         if session.pending_cancellation.send(()).is_err() {
             log::debug!("No pending native submissions to cancel");
         }
@@ -2495,15 +2507,27 @@ impl NativeAgentConnection {
 
         // Subscribe before spawning so cancellation also fences receipts that
         // have not yet been polled. A later submission gets a fresh subscription.
-        let Some(mut cancellation) = self
-            .0
-            .read(cx)
-            .sessions
-            .get(&session_id)
-            .map(|session| session.pending_cancellation.receiver())
+        let Some((mut cancellation, handoff_requested, latch_turn_yield, thread)) =
+            self.0.read(cx).sessions.get(&session_id).map(|session| {
+                let thread = &session.thread;
+                let has_running_subagents = thread.read(cx).has_running_subagents(cx);
+                let pending_subagent_request = thread.read(cx).pending_subagent_request();
+                let handoff_requested = content.is_some()
+                    && has_running_subagents
+                    && (pending_subagent_request || thread.read(cx).subagents_survived_turn());
+                (
+                    session.pending_cancellation.receiver(),
+                    handoff_requested,
+                    content.is_some() && pending_subagent_request && has_running_subagents,
+                    session.thread.clone(),
+                )
+            })
         else {
             return (Task::ready(Err(anyhow!("Session not found"))), completion);
         };
+        if latch_turn_yield {
+            thread.update(cx, |thread, _| thread.request_yield_for_subagent_request());
+        }
         let agent = self.0.downgrade();
         let driver_completion = completion.clone();
         let receipt = cx.spawn(async move |cx| {
@@ -2522,7 +2546,8 @@ impl NativeAgentConnection {
                         if execution.completion.peek().is_some() {
                             return Ok(None);
                         }
-                        if let Some(sender) = execution.cancellation.take()
+                        if !handoff_requested
+                            && let Some(sender) = execution.cancellation.take()
                             && sender
                                 .send(NativeCancellation::InterruptedByFollowUp)
                                 .is_err()
@@ -3372,8 +3397,8 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn cancel(&self, session_id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
         log::info!("Cancelling on session: {}", session_id);
-        self.0.update(cx, |agent, _cx| {
-            agent.cancel_session(session_id);
+        self.0.update(cx, |agent, cx| {
+            agent.cancel_session(session_id, cx);
         });
         Ok(())
     }
@@ -3750,6 +3775,11 @@ impl NativeThreadEnvironment {
             anyhow::Ok((session.thread.clone(), acp_thread))
         })??;
 
+        let parent_session_id = self.thread.read_with(cx, |thread, _| thread.id().clone())?;
+        anyhow::ensure!(
+            subagent_thread.read(cx).parent_thread_id().as_ref() == Some(&parent_session_id),
+            "Session {session_id} is not a subagent owned by this thread"
+        );
         let depth = subagent_thread.read(cx).depth();
 
         if let Some(parent_thread_entity) = self.thread.upgrade() {
@@ -3940,7 +3970,13 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     }
 }
 
+struct PreparedSubagentSend {
+    cancelled: Rc<std::cell::Cell<bool>>,
+    _subscription: gpui::Subscription,
+}
+
 pub struct NativeSubagentHandle {
+    prepared_send: std::cell::RefCell<Option<PreparedSubagentSend>>,
     session_id: acp_v2::SessionId,
     parent_thread: WeakEntity<Thread>,
     subagent_thread: Entity<Thread>,
@@ -3955,6 +3991,7 @@ impl NativeSubagentHandle {
         parent_thread_entity: Entity<Thread>,
     ) -> Self {
         NativeSubagentHandle {
+            prepared_send: Default::default(),
             session_id,
             subagent_thread,
             parent_thread: parent_thread_entity.downgrade(),
@@ -3972,19 +4009,70 @@ impl SubagentHandle for NativeSubagentHandle {
         self.acp_thread.read(cx).entries().len()
     }
 
+    fn prepare_send(&self, cx: &mut App) -> Result<()> {
+        let cancelled = Rc::new(std::cell::Cell::new(false));
+        let subscription = cx.subscribe(&self.subagent_thread, {
+            let cancelled = cancelled.clone();
+            move |_, _: &crate::thread::SubagentsCancelled, _| cancelled.set(true)
+        });
+        self.parent_thread.update(cx, |parent, _| {
+            parent.register_running_subagent(self.subagent_thread.downgrade())
+        })?;
+        self.prepared_send.replace(Some(PreparedSubagentSend {
+            cancelled,
+            _subscription: subscription,
+        }));
+        Ok(())
+    }
+
+    fn supports_timeouts(&self) -> bool {
+        true
+    }
+
+    fn activity(&self, cx: &App) -> crate::thread::SubagentActivity {
+        self.subagent_thread.read(cx).subagent_activity(cx)
+    }
+
+    fn cancel(&self, cx: &mut App) -> Task<()> {
+        let cancellation = self
+            .subagent_thread
+            .update(cx, |thread, cx| thread.request_cancel(cx));
+        if let Err(error) = self.parent_thread.update(cx, |parent, cx| {
+            parent.unregister_running_subagent(&self.session_id, cx);
+        }) {
+            log::debug!("Subagent parent was released during cancellation: {error:#}");
+        }
+        cancellation
+    }
+
+    fn inspect(&self, cx: &App) -> Result<serde_json::Value> {
+        let thread = self.subagent_thread.read(cx);
+        Ok(serde_json::json!({
+            "session_id": self.session_id,
+            "running": !thread.is_turn_complete(),
+            "activity": thread.subagent_activity(cx),
+            "ongoing_tools": thread.ongoing_tools(),
+            "ongoing_output": thread.ongoing_visible_output(),
+            "transcript": thread.conversation_page(0, 10, None, true),
+        }))
+    }
+
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
         let thread = self.subagent_thread.clone();
         let acp_thread = self.acp_thread.clone();
         let subagent_session_id = self.session_id.clone();
         let parent_thread = self.parent_thread.clone();
+        let prepared_send = self.prepared_send.borrow_mut().take();
 
         cx.spawn(async move |cx| {
             let (task, token_limit_rx, _subscription) = cx.update(|cx| {
-                parent_thread
-                    .update(cx, |parent_thread, _cx| {
-                        parent_thread.register_running_subagent(thread.downgrade())
-                    })
-                    .ok();
+                if prepared_send.is_none() {
+                    parent_thread
+                        .update(cx, |parent_thread, _cx| {
+                            parent_thread.register_running_subagent(thread.downgrade())
+                        })
+                        .ok();
+                }
 
                 let ratio_before_prompt = thread
                     .read(cx)
@@ -4003,14 +4091,16 @@ impl SubagentHandle for NativeSubagentHandle {
                         }
                     },
                 );
-                let task = match acp_thread.read(cx).connection().clone().into_any()
+                let task = if prepared_send.as_ref().is_some_and(|prepared| prepared.cancelled.get()) {
+                    Task::ready(Ok(acp_v2::StopReason::Cancelled))
+                } else { match acp_thread.read(cx).connection().clone().into_any()
                     .downcast::<NativeAgentConnection>()
                 {
                     Ok(connection) => connection.send_and_wait_for_completion(
                         acp_thread.clone(), vec![message.into()], cx,
                     ),
                     Err(_) => Task::ready(Err(anyhow!("Subagent connection is not native"))),
-                };
+                }};
                 (task, token_limit_rx, subscription)
             });
 
@@ -4154,6 +4244,21 @@ impl TerminalHandle for AcpTerminalHandle {
     fn wait_for_exit(&self, cx: &AsyncApp) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
         self.terminal
             .read_with(cx, |term, _cx| term.wait_for_exit())
+    }
+
+    fn wait_for_queue_completion(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
+        cx.update(|cx| {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.wait_for_queue_completion(cx))
+        })
+    }
+
+    fn kill_queued_process_group(&self, cx: &AsyncApp) -> Result<()> {
+        self.terminal
+            .read_with(cx, |terminal, cx| terminal.kill_queued_process_group(cx))
     }
 
     fn current_output(&self, cx: &AsyncApp) -> Result<ProcessOutput> {
@@ -4694,6 +4799,199 @@ mod internal_tests {
             .skip(1)
             .map(language_model::LanguageModelRequestMessage::string_contents)
             .collect()
+    }
+
+    struct HandoffWaitTool;
+
+    impl crate::AgentTool for HandoffWaitTool {
+        type Input = ();
+        type Output = String;
+
+        const NAME: &'static str = "handoff_wait";
+
+        fn kind() -> acp_v2::ToolKind {
+            acp_v2::ToolKind::Other
+        }
+
+        fn initial_title(
+            &self,
+            _input: Result<Self::Input, serde_json::Value>,
+            _cx: &mut App,
+        ) -> SharedString {
+            "Controlled child wait".into()
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _input: crate::ToolInput<Self::Input>,
+            events: crate::ToolCallEventStream,
+            cx: &mut App,
+        ) -> Task<Result<Self::Output, Self::Output>> {
+            cx.spawn(async move |cx| {
+                loop {
+                    if cx.update(|cx| events.pending_subagent_request(cx)) {
+                        return Ok("yielded_for_new_request".to_string());
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(10))
+                        .await;
+                }
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_native_handoff_releases_wait_without_cancelling_subagent(
+        cx: &mut TestAppContext,
+    ) {
+        use language_model::{
+            LanguageModelCompletionEvent, LanguageModelToolUse, LanguageModelToolUseInput,
+        };
+
+        let fake = init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("fake");
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            for profile in settings.profiles.values_mut() {
+                profile.tools.insert(HandoffWaitTool::NAME.into(), true);
+            }
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        parent.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_tool(HandoffWaitTool);
+        });
+        let child_handle = cx.update(|cx| {
+            NativeThreadEnvironment {
+                agent: agent.downgrade(),
+                thread: parent.downgrade(),
+                acp_thread: acp_thread.downgrade(),
+            }
+            .create_subagent_thread("Controlled slow child".to_string(), None, cx)
+            .expect("create controlled child")
+        });
+        let child_session_id = child_handle.id();
+        let child = cx.update(|cx| native_thread_for_session(&agent, &child_session_id, cx));
+        cx.update(|cx| child_handle.prepare_send(cx))
+            .expect("prepare child send");
+        let child_cancelled = Rc::new(std::cell::Cell::new(false));
+        let _child_cancellation_subscription = cx.update(|cx| {
+            cx.subscribe(&child, {
+                let child_cancelled = child_cancelled.clone();
+                move |_, _: &crate::thread::CancellationRequested, _| child_cancelled.set(true)
+            })
+        });
+        let mut child_task = cx.update(|cx| {
+            let child_handle = child_handle.clone();
+            cx.spawn(async move |cx| child_handle.send("keep working".to_string(), cx).await)
+        });
+        cx.run_until_parked();
+        assert!(
+            !fake.pending_completions_for(&model).is_empty(),
+            "child reaches model and remains pending"
+        );
+        assert!(futures::poll!(&mut child_task).is_pending());
+
+        let (first_receipt, first_completion) = cx.update(|cx| {
+            connection.submit_native(session_id.clone(), Some(vec!["wait for child".into()]), cx)
+        });
+        first_receipt.await.expect("first request accepted");
+        cx.run_until_parked();
+        let first_request = fake
+            .pending_completions_for(&model)
+            .pop()
+            .expect("first request reaches model");
+        fake.send_event(
+            &model,
+            &first_request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: "handoff_wait_call".into(),
+                name: HandoffWaitTool::NAME.into(),
+                raw_input: "{}".into(),
+                input: LanguageModelToolUseInput::Json(json!({})),
+                is_input_complete: true,
+                thought_signature: None,
+            }),
+        );
+        fake.end_stream(&model, &first_request);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            parent.update(cx, |thread, cx| {
+                thread.set_pending_subagent_request(true, cx)
+            })
+        });
+        cx.update(|cx| {
+            parent.update(cx, |thread, cx| {
+                thread.set_pending_subagent_request(false, cx)
+            })
+        });
+        cx.run_until_parked();
+        let mut completion_poll = first_completion.clone();
+        assert!(futures::poll!(&mut completion_poll).is_pending());
+
+        parent.update(cx, |thread, cx| {
+            thread.set_pending_subagent_request(true, cx)
+        });
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        assert!(!child_cancelled.get(), "handoff must not stop the child");
+        assert!(futures::poll!(&mut child_task).is_pending());
+        assert!(parent.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+        parent.update(cx, |thread, cx| {
+            thread.set_pending_subagent_request(false, cx)
+        });
+        assert!(parent.read_with(cx, |thread, _| thread.subagents_survived_turn()));
+
+        let (second_receipt, second_completion) = cx.update(|cx| {
+            connection.submit_native(
+                session_id.clone(),
+                Some(vec!["continue while child runs".into()]),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        second_receipt
+            .await
+            .expect("new request is accepted after the old turn completes");
+        assert_eq!(
+            first_completion
+                .await
+                .expect("old turn completes")
+                .expect("old turn succeeds"),
+            acp_v2::StopReason::EndTurn
+        );
+        assert!(!child_cancelled.get(), "handoff must not stop the child");
+        assert!(futures::poll!(&mut child_task).is_pending());
+        assert!(parent.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+
+        cx.run_until_parked();
+        let second_request = fake
+            .pending_completions_for(&model)
+            .pop()
+            .expect("next parent turn reaches model");
+        fake.send_text(&model, &second_request, "new request handled");
+        fake.end_stream(&model, &second_request);
+        cx.run_until_parked();
+        assert_eq!(
+            second_completion
+                .await
+                .expect("new turn completes")
+                .expect("new turn succeeds"),
+            acp_v2::StopReason::EndTurn
+        );
+
+        cx.update(|cx| connection.cancel(&session_id, cx))
+            .expect("stop succeeds");
+        cx.run_until_parked();
+        assert!(
+            child_cancelled.get(),
+            "explicit Stop still cancels the child"
+        );
+        assert!(child_task.await.is_err());
     }
 
     #[gpui::test]
@@ -9616,12 +9914,14 @@ mod internal_tests {
             .unwrap();
         cx.update(|cx| environment.resume_subagent_thread(child.id(), cx))
             .expect("resume the child");
-        // Resuming a session the parent did not create, including itself, must not make
-        // the parent own it: that would be a reference cycle or a self-update.
-        cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, cx))
-            .expect("resume an unrelated live session");
-        cx.update(|cx| environment.resume_subagent_thread(parent_session_id, cx))
-            .expect("resume the parent's own session");
+        assert!(
+            cx.update(|cx| environment.resume_subagent_thread(unrelated_session_id, cx))
+                .is_err()
+        );
+        assert!(
+            cx.update(|cx| environment.resume_subagent_thread(parent_session_id, cx))
+                .is_err()
+        );
 
         parent.read_with(cx, |parent, cx| {
             assert_eq!(

@@ -64,6 +64,10 @@ You can click on the card that contains your message and re-submit it with an ad
 
 Messages sent while the agent is in the generating state get, by default, queued.
 
+**While native Zed subagents are running**, you can type another request and press Enter or click Send normally. The parent finishes its current model/tool step at a safe boundary and handles the new request while its subagents continue working. Waiting subagent tools return their current status rather than waiting for every child to finish. You do not need to select Steer, stop generation, or cancel the subagents. Requests stay in submission order, and you can remove a pending request before it is dispatched.
+
+Queued requests also become eligible for this handoff if subagents start after the request was queued. Selecting **Send Now** while native subagents are currently running preserves them too, including for a nonfront queued request. Zed checks the current child state when you send; an old queue flag does not determine whether work is cancelled. With no active subagents, and for external agents, the usual queueing behavior below is unchanged. Explicit Stop still cancels running work, including subagents.
+
 By default, queued messages get sent once the agent finishes generating. If you want a queued message to reach the Zed Agent sooner—interrupting it at its next step (usually between a tool call and a response) rather than waiting for it to finish—toggle "Steer" on that message. Steering is only available for the Zed Agent, since Zed can't detect turn boundaries for external agents.
 
 You can edit or remove (an individual or all) queued messages.

@@ -48,6 +48,40 @@ pub struct LastRejectUndo {
     pub buffers: Vec<PerBufferUndo>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ActualBufferRead {
+    version: clock::Global,
+    saved_mtime: MTime,
+}
+
+impl ActualBufferRead {
+    pub fn capture(buffer: &Buffer) -> Option<Self> {
+        let saved_mtime = buffer.saved_mtime()?;
+        if buffer.is_dirty()
+            || buffer.has_unsaved_edits()
+            || buffer.file()?.disk_state().mtime() != Some(saved_mtime)
+        {
+            return None;
+        }
+        Some(Self {
+            version: buffer.version(),
+            saved_mtime,
+        })
+    }
+
+    pub fn is_current(&self, buffer: &Buffer) -> bool {
+        !buffer.is_dirty()
+            && !buffer.has_unsaved_edits()
+            && buffer.version() == self.version
+            && buffer.saved_mtime() == Some(self.saved_mtime)
+            && buffer.file().and_then(|file| file.disk_state().mtime()) == Some(self.saved_mtime)
+    }
+
+    pub fn saved_mtime(&self) -> MTime {
+        self.saved_mtime
+    }
+}
+
 /// Tracks actions performed by tools in a thread
 pub struct ActionLog {
     /// Buffers that we want to notify the model about when they change.
@@ -62,6 +96,9 @@ pub struct ActionLog {
     last_reject_undo: Option<LastRejectUndo>,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
+    // Unlike file_read_times, this is evidence of a read by this agent only.
+    actual_file_read_times: HashMap<PathBuf, MTime>,
+    actual_buffer_reads: HashMap<Entity<Buffer>, ActualBufferRead>,
 }
 
 impl ActionLog {
@@ -73,6 +110,8 @@ impl ActionLog {
             linked_action_log: None,
             last_reject_undo: None,
             file_read_times: HashMap::default(),
+            actual_file_read_times: HashMap::default(),
+            actual_buffer_reads: HashMap::default(),
         }
     }
 
@@ -87,6 +126,30 @@ impl ActionLog {
 
     pub fn file_read_time(&self, path: &Path) -> Option<MTime> {
         self.file_read_times.get(path).copied()
+    }
+
+    pub fn actual_buffer_read(&self, buffer: &Entity<Buffer>) -> Option<&ActualBufferRead> {
+        self.actual_buffer_reads.get(buffer)
+    }
+
+    pub fn actual_file_read_time(&self, path: &Path) -> Option<MTime> {
+        self.actual_file_read_times.get(path).copied()
+    }
+
+    /// Records a successful filesystem read outside the project's buffer machinery.
+    /// This evidence must not be forwarded to linked agents that did not see the content.
+    pub fn record_actual_file_read(&mut self, path: PathBuf, mtime: MTime) {
+        self.actual_file_read_times.insert(path, mtime);
+    }
+
+    fn invalidate_actual_file_read(&mut self, buffer: &Entity<Buffer>, cx: &App) {
+        self.actual_buffer_reads.remove(buffer);
+        let buffer = buffer.read(cx);
+        if let Some(file) = buffer.file()
+            && let Some(local_file) = file.as_local()
+        {
+            self.actual_file_read_times.remove(&local_file.abs_path(cx));
+        }
     }
 
     fn update_file_read_time(&mut self, buffer: &Entity<Buffer>, cx: &App) {
@@ -532,6 +595,32 @@ impl ActionLog {
 
     /// Track a buffer as read by agent, so we can notify the model about user edits.
     pub fn buffer_read(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        let read = ActualBufferRead::capture(buffer.read(cx));
+        self.buffer_read_snapshot(buffer, read, cx);
+    }
+
+    /// The evidence must describe the response snapshot, not a newer version that
+    /// arrived while an asynchronous read or outline was being rendered.
+    pub fn buffer_read_snapshot(
+        &mut self,
+        buffer: Entity<Buffer>,
+        read: Option<ActualBufferRead>,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_actual_file_read(&buffer, cx);
+        if let Some(read) = read.filter(|read| read.is_current(buffer.read(cx))) {
+            if let Some(file) = buffer.read(cx).file()
+                && let Some(local_file) = file.as_local()
+            {
+                self.record_actual_file_read(local_file.abs_path(cx), read.saved_mtime);
+            }
+            self.actual_buffer_reads.insert(buffer.clone(), read);
+        }
+        self.buffer_read_impl(buffer, true, cx);
+    }
+
+    /// Tracks an internally opened buffer without claiming its content was returned to the agent.
+    pub fn buffer_observed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
         self.buffer_read_impl(buffer, true, cx);
     }
 
@@ -555,6 +644,7 @@ impl ActionLog {
 
     /// Mark a buffer as created by agent, so we can refresh it in the context
     pub fn buffer_created(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.invalidate_actual_file_read(&buffer, cx);
         self.buffer_created_impl(buffer, true, cx);
     }
 
@@ -578,6 +668,7 @@ impl ActionLog {
 
     /// Mark a buffer as edited by agent, so we can refresh it in the context
     pub fn buffer_edited(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.invalidate_actual_file_read(&buffer, cx);
         self.buffer_edited_impl(buffer, true, cx);
     }
 
@@ -607,6 +698,7 @@ impl ActionLog {
     }
 
     pub fn will_delete_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.invalidate_actual_file_read(&buffer, cx);
         // Ok to propagate file read time removal to linked action log
         self.remove_file_read_time(&buffer, cx);
         let has_linked_action_log = self.linked_action_log.is_some();
@@ -808,7 +900,8 @@ impl ActionLog {
                 // Clear all tracked edits for this buffer and start over as if we just read it.
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
                 self.tracked_buffers.remove(&buffer);
-                self.buffer_read(buffer.clone(), cx);
+                self.invalidate_actual_file_read(&buffer, cx);
+                self.buffer_observed(buffer.clone(), cx);
                 cx.notify();
                 save
             }
@@ -3320,6 +3413,153 @@ mod tests {
             parent_changed.contains(&buffer_a) && parent_changed.contains(&buffer_b),
             "parent should contain both buffer_a and buffer_b"
         );
+    }
+
+    #[gpui::test]
+    async fn test_actual_file_read_provenance_is_local_and_read_only(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "content"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent = cx.new(|_| ActionLog::new(project.clone()));
+        let child =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent.clone()));
+        let sibling =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent.clone()));
+        let project_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .expect("file path");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("open buffer");
+        let path = PathBuf::from(path!("/dir/file"));
+        child.update(cx, |log, cx| log.buffer_observed(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| log.file_read_time(path.as_ref()).is_some()));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        child.update(cx, |log, cx| log.buffer_created(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        child.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        child.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_some()
+        }));
+        assert!(child.read_with(cx, |log, _| log.actual_buffer_read(&buffer).is_some()));
+        assert!(parent.read_with(cx, |log, _| log.actual_buffer_read(&buffer).is_none()));
+        assert!(parent.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        assert!(sibling.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        child.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        assert!(child.read_with(cx, |log, _| log.file_read_time(path.as_ref()).is_some()));
+        child.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_some()
+        }));
+        parent.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        let later_child =
+            cx.new(|_| ActionLog::new(project).with_linked_action_log(parent.clone()));
+        assert!(later_child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        child.update(cx, |log, cx| log.will_delete_buffer(buffer, cx));
+        assert!(child.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_actual_read_uses_loaded_mtime_not_observed_metadata(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "old content"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let log = cx.new(|_| ActionLog::new(project.clone()));
+        let project_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .expect("path");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("buffer");
+        let new_mtime = MTime::from_seconds_and_nanos(90_000_000, 0);
+        cx.update(|cx| {
+            let new_file = {
+                let state = buffer.read(cx);
+                let file = state.file().expect("file");
+                assert_ne!(state.saved_mtime(), Some(new_mtime));
+                project::File {
+                    worktree: project
+                        .read(cx)
+                        .worktree_for_id(file.worktree_id(cx), cx)
+                        .expect("worktree"),
+                    path: file.path().clone(),
+                    disk_state: language::DiskState::Present {
+                        mtime: new_mtime,
+                        size: 11,
+                    },
+                    entry_id: None,
+                    is_local: true,
+                    is_private: false,
+                }
+            };
+            buffer.update(cx, |buffer, cx| buffer.file_updated(Arc::new(new_file), cx));
+            log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            assert_eq!(buffer.read(cx).text(), "old content");
+            assert_eq!(
+                log.read(cx).file_read_time(path!("/dir/file").as_ref()),
+                Some(new_mtime)
+            );
+            assert!(
+                log.read(cx)
+                    .actual_file_read_time(path!("/dir/file").as_ref())
+                    .is_none()
+            );
+            assert!(log.read(cx).actual_buffer_read(&buffer).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_actual_path_read_is_not_forwarded(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "content"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent = cx.new(|_| ActionLog::new(project.clone()));
+        let child = cx.new(|_| ActionLog::new(project).with_linked_action_log(parent.clone()));
+        let path = PathBuf::from(path!("/dir/file"));
+        let mtime = fs
+            .metadata(path.as_ref())
+            .await
+            .expect("metadata")
+            .expect("file")
+            .mtime;
+        child.update(cx, |log, _| {
+            log.record_actual_file_read(path.clone(), mtime)
+        });
+        assert_eq!(
+            child.read_with(cx, |log, _| log.actual_file_read_time(path.as_ref())),
+            Some(mtime)
+        );
+        assert!(parent.read_with(cx, |log, _| {
+            log.actual_file_read_time(path.as_ref()).is_none()
+        }));
+        assert!(child.read_with(cx, |log, _| log.file_read_time(path.as_ref()).is_none()));
     }
 
     #[gpui::test]

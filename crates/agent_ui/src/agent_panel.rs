@@ -5664,6 +5664,10 @@ impl AgentPanel {
             _ => focus_handle.clone(),
         };
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
+        let showing_native_agent = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).agent_key().is_native())
+            .unwrap_or_else(|| self.selected_agent(cx).is_native());
 
         let conversation_view = match &self.base_view {
             BaseView::AgentThread { conversation_view } => Some(conversation_view.clone()),
@@ -5841,6 +5845,13 @@ impl AgentPanel {
                             menu = menu
                                 .separator()
                                 .action("Profiles", Box::new(ManageProfiles::default()));
+
+                            if showing_native_agent {
+                                menu = menu.action(
+                                    "Subagent Model…",
+                                    Box::new(crate::SelectSubagentModel),
+                                );
+                            }
                         }
 
                         menu = menu

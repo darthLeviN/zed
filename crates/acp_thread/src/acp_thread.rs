@@ -162,6 +162,7 @@ pub fn command_category_from_meta(meta: Option<&acp_v2::Meta>) -> Option<Command
 
 /// Key used in ACP ToolCall meta to store the session id and message indexes
 pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
+pub const SUBAGENT_SESSION_CARDS_META_KEY: &str = "subagent_session_cards";
 
 pub const SANDBOX_AUTHORIZATION_META_KEY: &str = "sandbox_authorization";
 
@@ -329,6 +330,36 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp_v2::Meta>) -> Option<Su
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubagentSessionCard {
+    pub session_info: SubagentSessionInfo,
+    pub label: String,
+    pub status: SubagentSessionCardStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSessionCardStatus {
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+pub fn subagent_session_cards_from_meta(meta: &Option<acp_v2::Meta>) -> Vec<SubagentSessionCard> {
+    let Some(serde_json::Value::Array(cards)) = meta
+        .as_ref()
+        .and_then(|meta| meta.get(SUBAGENT_SESSION_CARDS_META_KEY))
+    else {
+        return Vec::new();
+    };
+    cards
+        .iter()
+        .filter_map(|card| serde_json::from_value(card.clone()).ok())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1883,9 +1914,14 @@ impl ToolCall {
             })
     }
 
+    pub fn subagent_session_cards(&self) -> Vec<SubagentSessionCard> {
+        subagent_session_cards_from_meta(&self.meta)
+    }
+
     pub fn is_subagent(&self) -> bool {
         self.tool_name.as_ref().is_some_and(|s| s == "spawn_agent")
             || self.subagent_session_info.is_some()
+            || !self.subagent_session_cards().is_empty()
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
@@ -4495,10 +4531,18 @@ impl AcpThread {
 
     /// The first idle state this subagent reported after the entry at `entry_ix` arrived.
     pub fn subagent_outcome_after(&self, entry_ix: usize) -> Option<&acp_v2::StateUpdate> {
+        self.subagent_outcome_boundary_after(entry_ix)
+            .map(|(_, state)| state)
+    }
+
+    pub fn subagent_outcome_boundary_after(
+        &self,
+        entry_ix: usize,
+    ) -> Option<(usize, &acp_v2::StateUpdate)> {
         self.subagent_outcomes
             .iter()
             .find(|(entry_count, _)| *entry_count > entry_ix)
-            .map(|(_, state)| state)
+            .map(|(entry_count, state)| (*entry_count, state))
     }
 
     pub fn foreground_activity(&self) -> ForegroundActivity {
@@ -6654,8 +6698,14 @@ impl AcpThread {
     pub fn tool_call_for_subagent(&self, session_id: &acp_v2::SessionId) -> Option<&ToolCall> {
         self.entries.iter().rev().find_map(|entry| match entry {
             AgentThreadEntry::ToolCall(tool_call) => {
-                if let Some(subagent_session_info) = &tool_call.subagent_session_info
-                    && &subagent_session_info.session_id == session_id
+                if tool_call
+                    .subagent_session_info
+                    .as_ref()
+                    .is_some_and(|info| &info.session_id == session_id)
+                    || tool_call
+                        .subagent_session_cards()
+                        .iter()
+                        .any(|card| &card.session_info.session_id == session_id)
                 {
                     Some(tool_call)
                 } else {
@@ -16752,6 +16802,66 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn test_subagent_session_cards_preserve_multiple_sessions_and_skip_malformed_entries() {
+        let cards = json!([
+            {
+                "session_info": {
+                    "session_id": "child-one",
+                    "message_start_index": 2,
+                    "message_end_index": 7
+                },
+                "label": "First",
+                "status": "completed",
+                "error": null
+            },
+            {"session_info": false},
+            {
+                "session_info": {
+                    "session_id": "child-two",
+                    "message_start_index": 8
+                },
+                "label": "Second",
+                "status": "running",
+                "error": null
+            }
+        ]);
+        let meta = Some(acp_v2::Meta::from_iter([(
+            SUBAGENT_SESSION_CARDS_META_KEY.into(),
+            cards.clone(),
+        )]));
+        let parsed = subagent_session_cards_from_meta(&meta);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].session_info.session_id,
+            acp_v2::SessionId::new("child-one")
+        );
+        assert_eq!(parsed[0].session_info.message_start_index, 2);
+        assert_eq!(parsed[0].session_info.message_end_index, Some(7));
+        assert_eq!(parsed[0].label, "First");
+        assert!(matches!(
+            parsed[0].status,
+            SubagentSessionCardStatus::Completed
+        ));
+        assert_eq!(
+            parsed[1].session_info.session_id,
+            acp_v2::SessionId::new("child-two")
+        );
+        assert_eq!(parsed[1].session_info.message_end_index, None);
+        assert!(matches!(
+            parsed[1].status,
+            SubagentSessionCardStatus::Running
+        ));
+
+        let replayed: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&meta.expect("metadata")).expect("serialize metadata"),
+        )
+        .expect("replay metadata");
+        let replayed_meta = Some(serde_json::from_value(replayed).expect("metadata value"));
+        assert_eq!(subagent_session_cards_from_meta(&replayed_meta).len(), 2);
     }
 
     #[test]

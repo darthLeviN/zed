@@ -756,13 +756,19 @@ fn resolve_outcome_from_selection(
 
 fn subagent_sessions_referenced_by_tool_calls(
     thread: &AcpThread,
-) -> impl Iterator<Item = &acp_v2::SessionId> {
-    thread.entries().iter().filter_map(|entry| match entry {
+) -> impl Iterator<Item = acp_v2::SessionId> + '_ {
+    thread.entries().iter().flat_map(|entry| match entry {
         AgentThreadEntry::ToolCall(call) => call
             .subagent_session_info
-            .as_ref()
-            .map(|info| &info.session_id),
-        _ => None,
+            .iter()
+            .map(|info| info.session_id.clone())
+            .chain(
+                call.subagent_session_cards()
+                    .into_iter()
+                    .map(|card| card.session_info.session_id),
+            )
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
     })
 }
 
@@ -1972,6 +1978,14 @@ impl ConversationView {
                         active.sync_generating_indicator(cx);
                     });
                 }
+                if is_subagent
+                    && let Some(parent_session_id) = thread.read(cx).parent_session_id()
+                    && let Some(parent_view) = self.thread_view(parent_session_id)
+                {
+                    parent_view.update(cx, |parent_view, cx| {
+                        parent_view.sync_queue_flag_to_native_thread(cx);
+                    });
+                }
             }
             AcpThreadEvent::SubmissionUpdated(submission_id) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2042,6 +2056,11 @@ impl ConversationView {
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 if let Some(subagent) = thread.read(cx).subagent(subagent_session_id).cloned() {
                     self.add_subagent_thread_view(subagent, window, cx);
+                }
+                if let Some(parent_view) = self.thread_view(&session_id) {
+                    parent_view.update(cx, |parent_view, cx| {
+                        parent_view.sync_queue_flag_to_native_thread(cx);
+                    });
                 }
             }
             // The parent's card and permission rows read the association; the notify below
@@ -2561,9 +2580,7 @@ impl ConversationView {
             self.add_subagent_thread_view(subagent, window, cx);
         }
         let referenced_subagent_ids =
-            subagent_sessions_referenced_by_tool_calls(parent_thread.read(cx))
-                .cloned()
-                .collect::<Vec<_>>();
+            subagent_sessions_referenced_by_tool_calls(parent_thread.read(cx)).collect::<Vec<_>>();
         for subagent_id in referenced_subagent_ids {
             self.load_subagent_session(subagent_id, parent_session_id.clone(), cx);
         }
@@ -5148,6 +5165,595 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_composer_send_hands_off_to_parent_while_spawned_child_runs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| cx.update_flags(true, vec!["subagents".to_string()]));
+
+        let fs = FakeFs::new(cx.executor());
+        let fake = cx.update(|cx| {
+            let fake = language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            fake
+        });
+        let server = cx.update(|cx| {
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            NativeAgentServer::new(fs, thread_store)
+        });
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let model = fake.model("fake");
+        let native_thread = conversation_view
+            .read_with(cx, |view, cx| view.as_native_thread(cx))
+            .expect("native thread");
+        native_thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        cx.run_until_parked();
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("start parent work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let parent_request = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .next()
+            .expect("initial composer send reaches the parent model");
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("continue parent work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).update(cx, |view, _| {
+            assert_eq!(view.message_queue.len(), 1);
+            assert!(
+                !view
+                    .message_queue
+                    .front_wants_independent_subagent_request()
+            );
+            assert!(view.message_queue.auto_send_candidate(true).is_none());
+            view.message_queue.pause();
+            assert!(view.message_queue.auto_send_candidate(false).is_none());
+            view.message_queue.resume();
+        });
+
+        fake.send_event(
+            &model,
+            &parent_request,
+            language_model::LanguageModelCompletionEvent::ToolUse(
+                language_model::LanguageModelToolUse {
+                    id: "spawn-groups".into(),
+                    name: "subagents".into(),
+                    raw_input: json!({
+                        "operation": "spawn_groups",
+                        "groups": [[{
+                            "label": "slow child",
+                            "message": "keep working on the child task"
+                        }]]
+                    })
+                    .to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(json!({
+                        "operation": "spawn_groups",
+                        "groups": [[{
+                            "label": "slow child",
+                            "message": "keep working on the child task"
+                        }]]
+                    })),
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            ),
+        );
+        fake.end_stream(&model, &parent_request);
+        cx.run_until_parked();
+
+        assert!(native_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+        let child_request = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .next()
+            .expect("spawned child reaches the model and remains pending");
+        let queue_state = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.message_queue.len(),
+                view.message_queue
+                    .front_wants_independent_subagent_request(),
+                view.thread.read(cx).status(),
+                view.thread.read(cx).foreground_activity(),
+            )
+        });
+        assert!(
+            native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()),
+            "pending request was not synchronized; queue state: {queue_state:?}"
+        );
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let pending_requests = fake.pending_completions_for(&model);
+        assert!(
+            pending_requests.contains(&child_request)
+                && !fake.is_stream_closed(&model, &child_request),
+            "the child model request must remain open after the composer send"
+        );
+        assert!(
+            pending_requests.iter().any(|request| request
+                .messages
+                .iter()
+                .any(|message| { message.string_contents().contains("continue parent work") })),
+            "the second composer message must reach the parent model without Send Now"
+        );
+        assert!(native_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+
+        let second_parent_request = pending_requests
+            .iter()
+            .find(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.string_contents().contains("continue parent work"))
+            })
+            .expect("second composer message reaches the parent model after the child starts")
+            .clone();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("normal composer while child runs", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+            assert!(
+                view.message_queue
+                    .front_wants_independent_subagent_request()
+            );
+        });
+
+        fake.send_text(&model, &second_parent_request, "parent turn completed");
+        fake.end_stream(&model, &second_parent_request);
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let pending_requests = fake.pending_completions_for(&model);
+        assert!(
+            !fake.is_stream_closed(&model, &child_request),
+            "normal composer send must not cancel the real child completion"
+        );
+        let normal_parent_request = pending_requests
+            .iter()
+            .find(|request| {
+                request.messages.iter().any(|message| {
+                    message
+                        .string_contents()
+                        .contains("normal composer while child runs")
+                })
+            })
+            .expect("normal composer send while the child runs reaches the parent")
+            .clone();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("explicitly send another parent request", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let queue_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _| view.message_queue.first_id())
+            .expect("message queued while the parent is generating");
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(queue_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !fake.is_stream_closed(&model, &child_request),
+            "Send Now must not cancel the real child completion"
+        );
+
+        fake.send_text(&model, &normal_parent_request, "parent turn completed");
+        fake.end_stream(&model, &normal_parent_request);
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let pending_requests = fake.pending_completions_for(&model);
+        assert!(
+            !fake.is_stream_closed(&model, &child_request),
+            "the child model request must still be open after Send Now"
+        );
+        assert!(
+            pending_requests
+                .iter()
+                .any(|request| request.messages.iter().any(|message| {
+                    message
+                        .string_contents()
+                        .contains("explicitly send another parent request")
+                })),
+            "Send Now must deliver the queued prompt to the parent model"
+        );
+        active_thread(&conversation_view, cx).update(cx, |view, cx| view.cancel_generation(cx));
+        cx.run_until_parked();
+        assert!(
+            fake.is_stream_closed(&model, &child_request),
+            "the explicit Stop action must still cancel the running child"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_send_now_rechecks_nonfront_entry_against_running_child(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| cx.update_flags(true, vec!["subagents".to_string()]));
+
+        let fs = FakeFs::new(cx.executor());
+        let fake = cx.update(|cx| {
+            let fake = language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            fake
+        });
+        let server = cx.update(|cx| {
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            NativeAgentServer::new(fs, thread_store)
+        });
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let model = fake.model("fake");
+        let native_thread = conversation_view
+            .read_with(cx, |view, cx| view.as_native_thread(cx))
+            .expect("native thread");
+        native_thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        cx.run_until_parked();
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("start parent work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let parent_request = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .next()
+            .expect("parent request reaches the model");
+
+        for prompt in ["front queued before child", "selected nonfront request"] {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(prompt, window, cx);
+            });
+            active_thread(&conversation_view, cx)
+                .update_in(cx, |view, window, cx| view.send(window, cx));
+            cx.run_until_parked();
+        }
+        let selected_queue_id = active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+            view.message_queue
+                .iter()
+                .nth(1)
+                .expect("second queued message")
+                .id
+        });
+
+        fake.send_event(
+            &model,
+            &parent_request,
+            language_model::LanguageModelCompletionEvent::ToolUse(
+                language_model::LanguageModelToolUse {
+                    id: "spawn-groups".into(),
+                    name: "subagents".into(),
+                    raw_input: json!({
+                        "operation": "spawn_groups",
+                        "groups": [[{
+                            "label": "slow child",
+                            "message": "keep working on the child task"
+                        }]]
+                    })
+                    .to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(json!({
+                        "operation": "spawn_groups",
+                        "groups": [[{
+                            "label": "slow child",
+                            "message": "keep working on the child task"
+                        }]]
+                    })),
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            ),
+        );
+        fake.end_stream(&model, &parent_request);
+        cx.run_until_parked();
+        assert!(native_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+        let child_request = fake
+            .pending_completions_for(&model)
+            .into_iter()
+            .next()
+            .expect("real spawned child reaches the model");
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+            let selected = view
+                .message_queue
+                .entry_by_id(selected_queue_id)
+                .expect("selected nonfront queue entry");
+            assert!(!selected.independent_subagent_request);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(selected_queue_id, window, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let pending_requests = fake.pending_completions_for(&model);
+        assert!(
+            !fake.is_stream_closed(&model, &child_request),
+            "Send Now on a nonfront entry must not cancel a currently running child"
+        );
+        assert!(
+            pending_requests
+                .iter()
+                .any(|request| request.messages.iter().any(|message| {
+                    message
+                        .string_contents()
+                        .contains("selected nonfront request")
+                })),
+            "the selected nonfront message must reach the parent model"
+        );
+        let selected_parent_request = pending_requests
+            .iter()
+            .find(|request| {
+                request.messages.iter().any(|message| {
+                    message
+                        .string_contents()
+                        .contains("selected nonfront request")
+                })
+            })
+            .expect("selected message reaches the parent")
+            .clone();
+
+        for prompt in ["stale front request", "queued while child is live"] {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(prompt, window, cx);
+            });
+            active_thread(&conversation_view, cx)
+                .update_in(cx, |view, window, cx| view.send(window, cx));
+            cx.run_until_parked();
+        }
+        let (stale_front_id, stale_queue_id) =
+            active_thread(&conversation_view, cx).update(cx, |view, _cx| {
+                let mut entries = view.message_queue.iter();
+                let front_id = entries.next().expect("front queue entry").id;
+                let selected = entries.next().expect("selected queue entry");
+                assert!(selected.independent_subagent_request);
+                (front_id, selected.id)
+            });
+        active_thread(&conversation_view, cx).update(cx, |view, _cx| {
+            assert!(
+                view.message_queue
+                    .entry_by_id(stale_front_id)
+                    .is_some_and(|entry| entry.independent_subagent_request)
+            );
+            view.message_queue.pause();
+        });
+
+        fake.send_text(&model, &child_request, "child complete");
+        fake.end_stream(&model, &child_request);
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        assert!(!native_thread.read_with(cx, |thread, cx| thread.has_running_subagents(cx)));
+
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            view.send_queued_message_now(stale_queue_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            fake.is_stream_closed(&model, &selected_parent_request),
+            "a stale independence snapshot must not preserve the parent generation after the child exits"
+        );
+        let pending_requests = fake.pending_completions_for(&model);
+        let selected_stale_parent_request = pending_requests
+            .iter()
+            .find(|request| {
+                request.messages.iter().any(|message| {
+                    message
+                        .string_contents()
+                        .contains("queued while child is live")
+                })
+            })
+            .expect("Send Now sends the selected entry after the child exits")
+            .clone();
+
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            assert!(view.message_editor.read(cx).is_empty(cx));
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            fake.is_stream_closed(&model, &selected_stale_parent_request),
+            "empty-composer fast track must recheck the front entry after its child exits"
+        );
+        assert!(fake.pending_completions_for(&model).iter().any(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.string_contents().contains("stale front request"))
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_subagent_request_pending_flag_tracks_valid_flagged_front_entry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let server = cx.update(|cx| {
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            NativeAgentServer::new(fs, thread_store)
+        });
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let native_thread = conversation_view
+            .read_with(cx, |view, cx| view.as_native_thread(cx))
+            .expect("native thread");
+
+        let first_id = active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "first",
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+            let first_id = thread.message_queue.first_id().expect("first queue entry");
+            thread
+                .message_queue
+                .entry_by_id_mut(first_id)
+                .expect("entry")
+                .independent_subagent_request = true;
+            thread.sync_queue_flag_to_native_thread(cx);
+            first_id
+        });
+        cx.run_until_parked();
+        assert!(native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()));
+        active_thread(&conversation_view, cx).update(cx, |thread, _cx| {
+            assert_eq!(thread.message_queue.len(), 1);
+            assert!(thread.message_queue.try_fast_track(true, true).is_none());
+            assert_eq!(thread.message_queue.len(), 1);
+            assert_eq!(
+                thread
+                    .message_queue
+                    .auto_send_candidate(false)
+                    .map(|entry| entry.id),
+                Some(first_id)
+            );
+        });
+
+        let second_id =
+            active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+                thread.add_to_queue(
+                    vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        "second",
+                    ))],
+                    vec![],
+                    window,
+                    cx,
+                );
+                let second_id = thread.message_queue.last_id().expect("second queue entry");
+                thread
+                    .message_queue
+                    .entry_by_id_mut(second_id)
+                    .expect("entry")
+                    .independent_subagent_request = true;
+                thread.sync_queue_flag_to_native_thread(cx);
+                assert_eq!(
+                    thread
+                        .message_queue
+                        .auto_send_candidate(false)
+                        .map(|entry| entry.id),
+                    Some(first_id)
+                );
+                second_id
+            });
+        let sent_id = active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            let entry = thread
+                .message_queue
+                .on_generation_stopped(false)
+                .expect("first queued request");
+            thread.sync_queue_flag_to_native_thread(cx);
+            entry.id
+        });
+        assert_eq!(sent_id, first_id);
+        assert!(native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()));
+
+        active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            thread.remove_from_queue(second_id, cx);
+        });
+        assert!(!native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()));
+
+        let invalid_id =
+            active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+                thread.add_to_queue(
+                    vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        "invalid",
+                    ))],
+                    vec![],
+                    window,
+                    cx,
+                );
+                let id = thread.message_queue.first_id().expect("queue entry");
+                let entry = thread.message_queue.entry_by_id_mut(id).expect("entry");
+                entry.independent_subagent_request = true;
+                entry.content = vec![acp_v2::ContentBlock::Other(acp_v2::OtherContentBlock::new(
+                    "_future",
+                    Default::default(),
+                ))];
+                thread.sync_queue_flag_to_native_thread(cx);
+                id
+            });
+        assert!(!native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()));
+
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.remove_from_queue(invalid_id, cx);
+            thread.add_to_queue(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "ordinary",
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        assert!(!native_thread.read_with(cx, |thread, _| thread.pending_subagent_request()));
+        active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            let ordinary_entry = thread.message_queue.first().expect("ordinary queued entry");
+            assert!(!ordinary_entry.independent_subagent_request);
+            assert_eq!(thread.message_queue.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_idle_fast_track_sends_independent_request_without_cancelling_parent_or_children(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let response = connection.defer_next_receipt_response();
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["request for parent".into()], vec![], window, cx);
+            let id = view.message_queue.first_id().expect("queued request");
+            view.message_queue
+                .entry_by_id_mut(id)
+                .expect("queued request")
+                .independent_subagent_request = true;
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            connection.take_cancel_calls().is_empty(),
+            "independent auto-dispatch must not cancel the parent or its running subagents"
+        );
+        assert_eq!(
+            connection.take_receipt_prompt(),
+            Some(vec!["request for parent".into()])
+        );
+        response
+            .send(Ok(acp_v2::PromptResponse::new("request for parent")))
+            .expect("parent request receipt");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn test_receipt_submission_waits_for_echo_and_reported_idle(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -7065,6 +7671,78 @@ pub(crate) mod tests {
             let subagent_id = subagent.read_with(cx, |subagent, _| subagent.session_id().clone());
             assert_eq!(state.status, expected, "{id} with {subagent_id}");
         }
+
+        let coordinated_card = acp_thread::SubagentSessionCard {
+            session_info: acp_thread::SubagentSessionInfo {
+                session_id: acp_v2::SessionId::new("reporting"),
+                message_start_index: 0,
+                message_end_index: None,
+            },
+            label: "Parallel task".to_string(),
+            status: acp_thread::SubagentSessionCardStatus::Running,
+            error: None,
+        };
+        let coordinated_state = reporting.read_with(cx, |thread, _| {
+            SubagentCardState::from_coordinated_tool_call(&coordinated_card, Some(thread))
+        });
+        assert_eq!(coordinated_state.status, SubagentStatus::Canceled);
+
+        silent.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                    cx,
+                )
+                .expect("initial idle state");
+            thread
+                .restore_subagent_outcomes(Vec::new(), cx)
+                .expect("restore no prior run outcomes");
+        });
+        let mut idle_card = coordinated_card.clone();
+        idle_card.session_info.session_id =
+            silent.read_with(cx, |thread, _| thread.session_id().clone());
+        let idle_state = silent.read_with(cx, |thread, _| {
+            assert!(matches!(
+                thread.foreground_state(),
+                Some(acp_v2::StateUpdate::Idle(_))
+            ));
+            SubagentCardState::from_coordinated_tool_call(&idle_card, Some(thread))
+        });
+        assert_eq!(idle_state.status, SubagentStatus::Running);
+
+        reporting.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("follow-up-prompt")
+                        .content(vec!["Continue working".into()]),
+                    cx,
+                )
+                .expect("follow-up prompt");
+            thread
+                .upsert_assistant_message(
+                    acp_v2::AgentMessage::new("follow-up").content(vec!["Resumed work".into()]),
+                    cx,
+                )
+                .expect("follow-up message");
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("follow-up running state");
+        });
+        let resumed_state = reporting.read_with(cx, |thread, _| {
+            SubagentCardState::from_coordinated_tool_call(&coordinated_card, Some(thread))
+        });
+        assert_eq!(resumed_state.status, SubagentStatus::Canceled);
+        assert_eq!(resumed_state.entries, coordinated_state.entries);
+        let end = resumed_state
+            .entries
+            .expect("run range")
+            .end
+            .expect("completed run boundary");
+        assert!(reporting.read_with(cx, |thread, _| end.saturating_add(1)
+            < thread.entries().len()));
     }
 
     #[gpui::test]
@@ -7081,14 +7759,59 @@ pub(crate) mod tests {
             let root_session_id = active_thread(&conversation_view, cx)
                 .read_with(cx, |view, _| view.session_id.clone());
             let referenced = acp_v2::SessionId::new("referenced");
-            conversation_view.update(cx, |view, cx| {
-                view.load_subagent_session(referenced.clone(), root_session_id, cx);
+            let root =
+                active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+            root.update(cx, |thread, cx| {
+                let metadata = acp_v2::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_CARDS_META_KEY.into(),
+                    serde_json::json!([
+                        {
+                            "session_info": {
+                                "session_id": "referenced",
+                                "message_start_index": 0,
+                                "message_end_index": null
+                            },
+                            "label": "First child",
+                            "status": "running",
+                            "error": null
+                        },
+                        {
+                            "session_info": {
+                                "session_id": "second-child",
+                                "message_start_index": 0,
+                                "message_end_index": null
+                            },
+                            "label": "Second child",
+                            "status": "completed",
+                            "error": null
+                        }
+                    ]),
+                )]);
+                thread
+                    .upsert_wire_tool_call(
+                        acp_v2::ToolCallUpdate::new("coordinate")
+                            .title("Coordinate")
+                            .status(acp_v2::ToolCallStatus::Completed)
+                            .meta(metadata),
+                        cx,
+                    )
+                    .expect("coordinated tool call should apply");
+            });
+            conversation_view.update_in(cx, |view, window, cx| {
+                view.add_subagent_thread_views(&root_session_id, window, cx);
             });
             cx.run_until_parked();
             assert_eq!(
                 conversation_view.read_with(cx, |view, _| view.thread_view(&referenced).is_some()),
                 !announces_subagents,
                 "a session a tool call references is loaded only where the RFD does not apply"
+            );
+            let second_child = acp_v2::SessionId::new("second-child");
+            assert_eq!(
+                conversation_view
+                    .read_with(cx, |view, _| view.thread_view(&second_child).is_some()),
+                !announces_subagents,
+                "each coordinated child session is hydrated"
             );
         }
     }
@@ -19311,17 +20034,21 @@ pub(crate) mod tests {
         .description(None);
         let (child_id, child_response) = request_test_generic_permission(&child, child_request, cx);
         root.update(cx, |thread, cx| {
-            let spawn = acp_v1::ToolCall::new("spawn-child", "Running child")
-                .name("spawn_agent")
+            let spawn = acp_v1::ToolCall::new("spawn-child", "Coordinate children")
+                .name("subagents")
                 .status(acp_v1::ToolCallStatus::InProgress)
                 .meta(acp_v1::Meta::from_iter([(
-                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
-                    serde_json::to_value(acp_thread::SubagentSessionInfo {
-                        session_id: child_session_id.clone(),
-                        message_start_index: 0,
-                        message_end_index: None,
-                    })
-                    .expect("subagent session context"),
+                    acp_thread::SUBAGENT_SESSION_CARDS_META_KEY.into(),
+                    serde_json::json!([{
+                        "session_info": {
+                            "session_id": child_session_id,
+                            "message_start_index": 0,
+                            "message_end_index": null
+                        },
+                        "label": "Running child",
+                        "status": "running",
+                        "error": null
+                    }]),
                 )]));
             thread.upsert_tool_call(spawn, cx).expect("spawning tool");
         });

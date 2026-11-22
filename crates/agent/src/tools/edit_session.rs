@@ -726,6 +726,7 @@ impl EditSession {
             .await
             .map_err(|e| e.to_string())?;
 
+        let is_global_skill = project_path.is_none();
         let buffer = match project_path {
             Some(project_path) => context
                 .project
@@ -744,6 +745,18 @@ impl EditSession {
         let file_changed_since_last_read =
             ensure_buffer_saved(&buffer, &abs_path, mode, &context, event_stream, cx).await?;
 
+        if mode == EditSessionMode::Write {
+            require_actual_read_for_overwrite(
+                &buffer,
+                &abs_path,
+                is_global_skill,
+                &context.project,
+                &context.action_log,
+                cx,
+            )
+            .await?;
+        }
+
         let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
         event_stream.update_diff(diff.clone());
         let finalize_diff_guard = util::defer(Box::new({
@@ -756,7 +769,7 @@ impl EditSession {
 
         context.action_log.update(cx, |log, cx| match mode {
             EditSessionMode::Write => log.buffer_created(buffer.clone(), cx),
-            EditSessionMode::Edit => log.buffer_read(buffer.clone(), cx),
+            EditSessionMode::Edit => log.buffer_observed(buffer.clone(), cx),
         });
 
         let old_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
@@ -1029,6 +1042,65 @@ fn agent_edit_buffer<I, S, T>(
     });
 }
 
+async fn require_actual_read_for_overwrite(
+    buffer: &Entity<Buffer>,
+    abs_path: &PathBuf,
+    is_global_skill: bool,
+    project: &Entity<Project>,
+    action_log: &Entity<ActionLog>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    // A remote absolute path must never be inspected through the client's Fs.
+    let local_path = buffer.read_with(cx, |buffer, cx| {
+        buffer
+            .file()
+            .and_then(|file| file.as_local())
+            .map(|file| file.abs_path(cx))
+    });
+    let local_metadata = if let Some(local_path) = &local_path {
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.metadata(local_path)
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    buffer.read_with(cx, |buffer_state, cx| {
+        let file = buffer_state.file().ok_or_else(|| "Cannot write a buffer without a backing file".to_string())?;
+        if !file.disk_state().exists() && local_metadata.is_none() {
+            return Ok(());
+        }
+        if local_path.is_some() && local_metadata.is_none() {
+            return Err(format!("Cannot overwrite {}: the file was deleted on disk since it was read; read it again first", abs_path.display()));
+        }
+        let log = action_log.read(cx);
+        let last_read = if let Some(read) = log.actual_buffer_read(buffer) {
+            if !read.is_current(buffer_state) {
+                return Err(format!("Cannot overwrite {}: the buffer or file has changed since it was last read; read it again first", abs_path.display()));
+            }
+            read.saved_mtime()
+        } else if is_global_skill
+            && let Some(mtime) = log.actual_file_read_time(abs_path)
+        {
+            // Global skills are read directly from Fs rather than from a buffer.
+            if buffer_state.is_dirty() || buffer_state.has_unsaved_edits() || buffer_state.saved_mtime() != Some(mtime)
+                || file.disk_state().mtime() != Some(mtime)
+            {
+                return Err(format!("Cannot overwrite {}: the file has changed since it was last read; read it again first", abs_path.display()));
+            }
+            mtime
+        } else {
+            return Err(format!("Cannot overwrite {}: read the existing file with read_file or read_files first (no actual read tracked for this agent)", abs_path.display()));
+        };
+        if let Some(metadata) = &local_metadata
+            && metadata.mtime != last_read
+        {
+            return Err(format!("Cannot overwrite {}: the file has changed on disk since it was last read; read it again first", abs_path.display()));
+        }
+        Ok(())
+    })
+}
+
 async fn ensure_buffer_saved(
     buffer: &Entity<Buffer>,
     abs_path: &PathBuf,
@@ -1298,4 +1370,171 @@ pub(crate) async fn test_resolve_path(
     cx: &mut gpui::TestAppContext,
 ) -> Result<ProjectPath, String> {
     cx.update(|cx| resolve_path(*mode, &PathBuf::from(path), project, cx))
+}
+
+#[cfg(test)]
+mod actual_read_tests {
+    use super::*;
+    use action_log::ActualBufferRead;
+    use gpui::TestAppContext;
+    use project::{FakeFs, File};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    async fn setup(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<ActionLog>, Entity<Buffer>, File) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({"file.txt": "original"}))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let log = cx.new(|_| ActionLog::new(project.clone()));
+        let project_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("root/file.txt", cx)
+            })
+            .expect("project path");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("buffer");
+        let file = buffer.read_with(cx, |buffer, cx| {
+            let file = buffer.file().expect("backing file");
+            File {
+                worktree: project
+                    .read(cx)
+                    .worktree_for_id(file.worktree_id(cx), cx)
+                    .expect("worktree"),
+                path: file.path().clone(),
+                disk_state: file.disk_state(),
+                entry_id: None,
+                is_local: false,
+                is_private: false,
+            }
+        });
+        // Exercise the non-local File contract without requiring a live RPC server.
+        buffer.update(cx, |buffer, cx| {
+            buffer.file_updated(Arc::new(file.clone()), cx)
+        });
+        (project, log, buffer, file)
+    }
+
+    async fn check(
+        project: &Entity<Project>,
+        log: &Entity<ActionLog>,
+        buffer: &Entity<Buffer>,
+        path: PathBuf,
+        cx: &mut TestAppContext,
+    ) -> Result<(), String> {
+        let project = project.clone();
+        let log = log.clone();
+        let buffer = buffer.clone();
+        cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                require_actual_read_for_overwrite(&buffer, &path, false, &project, &log, cx).await
+            })
+        })
+        .await
+    }
+
+    #[gpui::test]
+    async fn test_non_local_overwrite_uses_buffer_not_client_fs(cx: &mut TestAppContext) {
+        let (project, log, buffer, _) = setup(cx).await;
+        for path in [path!("/absent-on-client.txt"), path!("/root/file.txt")] {
+            let error = check(&project, &log, &buffer, path.into(), cx)
+                .await
+                .expect_err("remote blind overwrite");
+            assert!(error.contains("no actual read"));
+        }
+        log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        assert!(log.read_with(cx, |log, _| log.actual_buffer_read(&buffer).is_some()));
+        assert!(log.read_with(cx, |log, _| {
+            log.actual_file_read_time(path!("/root/file.txt").as_ref())
+                .is_none()
+        }));
+        for path in [path!("/absent-on-client.txt"), path!("/root/file.txt")] {
+            check(&project, &log, &buffer, path.into(), cx)
+                .await
+                .expect("remote read authorizes this buffer regardless of client path");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_pending_reload_does_not_certify_old_contents(cx: &mut TestAppContext) {
+        let (project, log, buffer, mut file) = setup(cx).await;
+        let loaded_mtime = buffer.read_with(cx, |buffer, _| buffer.saved_mtime());
+        let new_mtime = fs::MTime::from_seconds_and_nanos(90_000_000, 0);
+        assert_ne!(loaded_mtime, Some(new_mtime));
+        file.disk_state = language::DiskState::Present {
+            mtime: new_mtime,
+            size: 8,
+        };
+        cx.update(|cx| {
+            buffer.update(cx, |buffer, cx| buffer.file_updated(Arc::new(file), cx));
+            assert_eq!(buffer.read(cx).saved_mtime(), loaded_mtime);
+            assert_eq!(buffer.read(cx).text(), "original");
+            log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            assert!(log.read(cx).actual_buffer_read(&buffer).is_none());
+        });
+        check(&project, &log, &buffer, path!("/root/file.txt").into(), cx)
+            .await
+            .expect_err("old loaded contents are not the new disk revision");
+        buffer.update(cx, |buffer, cx| {
+            buffer.did_reload(
+                buffer.version(),
+                language::LineEnding::Unix,
+                Some(new_mtime),
+                cx,
+            );
+        });
+        log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        check(&project, &log, &buffer, path!("/root/file.txt").into(), cx)
+            .await
+            .expect("reread after reload");
+    }
+
+    #[gpui::test]
+    async fn test_response_snapshot_does_not_certify_later_buffer_version(cx: &mut TestAppContext) {
+        let (project, log, buffer, file) = setup(cx).await;
+        let response = buffer.read_with(cx, |buffer, _| ActualBufferRead::capture(buffer));
+        assert!(response.is_some());
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "changed")], None, cx);
+        });
+        log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        assert!(
+            log.read_with(cx, |log, _| log.actual_buffer_read(&buffer).is_none()),
+            "dirty reads must not authorize overwrites"
+        );
+        buffer.update(cx, |buffer, cx| {
+            buffer.did_reload(
+                buffer.version(),
+                language::LineEnding::Unix,
+                file.disk_state.mtime(),
+                cx,
+            );
+        });
+        log.update(cx, |log, cx| {
+            log.buffer_read_snapshot(buffer.clone(), response, cx)
+        });
+        assert!(log.read_with(cx, |log, _| log.actual_buffer_read(&buffer).is_none()));
+        check(&project, &log, &buffer, path!("/root/file.txt").into(), cx)
+            .await
+            .expect_err("the response did not contain the newer version");
+        log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        check(&project, &log, &buffer, path!("/root/file.txt").into(), cx)
+            .await
+            .expect("actual reread of the new version");
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "another change")], None, cx);
+        });
+        check(&project, &log, &buffer, path!("/root/file.txt").into(), cx)
+            .await
+            .expect_err("recorded response becomes stale after an edit");
+    }
 }
